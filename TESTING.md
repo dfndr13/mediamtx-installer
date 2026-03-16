@@ -68,7 +68,8 @@ ffmpeg -re -f lavfi -i testsrc=size=1280x720:rate=30 \
 **Verify:**
 - Go to **Streaming → Active Streams** in the sidebar
 - You should see `teststream` appear within 5 seconds
-- Click the stream name to watch it via HLS in your browser
+- Click **Watch** to view the stream via HLS in your browser
+- Click **Share** to generate a time-limited share link (4 hours); the link is copied to your clipboard. Open it in an incognito window or another device — the stream should play without logging in. After 4 hours (or if an admin revokes it), the link shows "Link Expired or Revoked".
 
 ### RTMP Stream
 

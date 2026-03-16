@@ -15,13 +15,16 @@ import time
 from datetime import datetime, timedelta
 import secrets
 import json
+import re
+import socket
+from urllib.parse import urlparse
 import psutil  # For system metrics
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)  # Generate secure secret key
 
 # Version - used by auto-update checker
-CURRENT_VERSION = "v1.1.7"
+CURRENT_VERSION = "v1.1.8"
 GITHUB_REPO = "takwerx/mediamtx-installer"
 GITHUB_RAW_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/config-editor/mediamtx_config_editor.py"
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -40,6 +43,10 @@ GROUP_METADATA_FILE = '/opt/mediamtx-webeditor/group_names.json'
 SRT_PASSPHRASE_BACKUP_FILE = '/opt/mediamtx-webeditor/srt_passphrase_backup.json'
 THEME_CONFIG_FILE = '/opt/mediamtx-webeditor/theme_config.json'
 LOGO_FILE = '/opt/mediamtx-webeditor/agency_logo'
+SHARE_LINKS_FILE = '/opt/mediamtx-webeditor/share_links.json'
+SHARE_MODE_FILE = '/opt/mediamtx-webeditor/share_mode.json'
+# Ku-band simulator scripts (run on receiver to impair incoming stream traffic)
+SIMULATOR_DIR = os.environ.get('MEDIAMTX_SIMULATOR_DIR', '/opt/mediamtx-webeditor/ku-band-simulator')
 
 # Default theme colors
 DEFAULT_THEME = {
@@ -193,6 +200,69 @@ def get_streaming_domain():
         'domain': None,
         'protocol': 'http'
     }
+
+# Share links (token-based, no-login stream access)
+def load_share_links():
+    """Load share links from JSON file."""
+    if os.path.exists(SHARE_LINKS_FILE):
+        try:
+            with open(SHARE_LINKS_FILE, 'r') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            pass
+    return {}
+
+def save_share_links(data):
+    """Save share links to JSON file."""
+    os.makedirs(os.path.dirname(SHARE_LINKS_FILE), exist_ok=True)
+    with open(SHARE_LINKS_FILE, 'w') as f:
+        json.dump(data, f, indent=2)
+
+def load_share_mode():
+    """Load per-stream share mode: public = static link, private = token link. Default private."""
+    if os.path.exists(SHARE_MODE_FILE):
+        try:
+            with open(SHARE_MODE_FILE, 'r') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_share_mode(data):
+    """Save per-stream share mode."""
+    try:
+        with open(SHARE_MODE_FILE, 'w') as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+def prune_expired_share_links(links):
+    """Remove expired links in-place, return pruned dict."""
+    now = time.time()
+    expired = [tok for tok, info in links.items() if info.get('expires') and info['expires'] < now]
+    for tok in expired:
+        del links[tok]
+    return links
+
+def hls_fetch_for_share(subpath):
+    """Fetch HLS content from MediaMTX (127.0.0.1:8888) with credentials. Returns (bytes, content_type)."""
+    import base64
+    import ssl
+    import urllib.request
+    cred = get_hlsviewer_credential()
+    streaming = get_streaming_domain()
+    proto = streaming.get('protocol', 'http')
+    url = f'{proto}://127.0.0.1:8888/{subpath}'
+    headers = {'Accept': '*/*'}
+    if cred:
+        auth = base64.b64encode(f"{cred['username']}:{cred['password']}".encode()).decode()
+        headers['Authorization'] = f'Basic {auth}'
+    req = urllib.request.Request(url, headers=headers)
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+        return resp.read(), resp.headers.get('Content-Type', 'application/octet-stream')
 
 # Authentication decorator
 def login_required(f):
@@ -2081,6 +2151,50 @@ HTML_TEMPLATE = '''
                     </form>
                 </div>
                 
+                <h3 style="margin-top: 30px;">Ku-band link simulator</h3>
+                <div class="alert alert-info" style="margin-bottom: 12px; padding: 12px 16px;">
+                    <p style="margin: 0 0 8px 0; font-size: 13px;">Impair incoming traffic so you can test HLS on a bad link (no flight needed). Run this on the <strong>receiver</strong> box.</p>
+                    <p style="margin: 8px 0 0 0; font-size: 13px;"><strong>Workflow:</strong> Click <strong>Simulate link</strong> on a source row below to turn the simulator on for that stream. When it is on, the red OFF button appears here so you can stop impairing.</p>
+                    <div id="simulator-off-state" style="margin-top: 10px; font-size: 13px; color: #888;">Simulator is off. Click <strong>Simulate link</strong> on a source below to impair that stream.</div>
+                    <div id="simulator-on-state" style="display: none; margin-top: 10px;">
+                        <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+                            <span style="font-size: 13px; color: #16a34a; font-weight: bold;">Simulator is ON</span>
+                            <button type="button" id="simulator-off-btn" class="btn" style="padding: 8px 16px; background: #c62828; color: #fff;">Turn simulator OFF</button>
+                            <span id="simulator-msg" style="font-size: 13px; color: #888;"></span>
+                        </div>
+                    </div>
+                </div>
+                <script>
+                (function(){
+                    var offState = document.getElementById('simulator-off-state');
+                    var onState = document.getElementById('simulator-on-state');
+                    var offBtn = document.getElementById('simulator-off-btn');
+                    var msgEl = document.getElementById('simulator-msg');
+                    function showSimulatorOn() { if (offState) offState.style.display = 'none'; if (onState) onState.style.display = 'block'; }
+                    function showSimulatorOff() { if (offState) offState.style.display = 'block'; if (onState) onState.style.display = 'none'; if (msgEl) msgEl.textContent = ''; }
+                    if (offBtn) {
+                        offBtn.addEventListener('click', function() {
+                            if (msgEl) msgEl.textContent = 'Turning off...';
+                            if (msgEl) msgEl.style.color = '#888';
+                            offBtn.disabled = true;
+                            fetch('/api/ku-band-simulator/off', { method: 'POST' })
+                                .then(function(r) { return r.json(); })
+                                .then(function(d) {
+                                    if (msgEl) msgEl.textContent = d.ok ? (d.msg || 'Simulator off') : (d.error || 'Failed');
+                                    if (msgEl) msgEl.style.color = d.ok ? '#16a34a' : '#dc2626';
+                                    offBtn.disabled = false;
+                                    if (d.ok) showSimulatorOff();
+                                })
+                                .catch(function() {
+                                    if (msgEl) { msgEl.textContent = 'Request failed'; msgEl.style.color = '#dc2626'; }
+                                    offBtn.disabled = false;
+                                });
+                        });
+                    }
+                    window.showSimulatorOn = showSimulatorOn;
+                })();
+                </script>
+                
                 <h3 style="margin-top: 30px;">Configured External Sources</h3>
                 <div id="external-sources-list" style="margin-top: 10px;">
                     <p style="color: #999;">Loading...</p>
@@ -3188,6 +3302,7 @@ HTML_TEMPLATE = '''
                             html = '<div style="display: flex; flex-direction: column; gap: 12px; margin-top: 15px;">';
                             data.streams.forEach(stream => {
                                 let groupDisplay = stream.publisher_group || '';
+                                const shareMode = stream.share_mode || 'private';
                                 const watchUrl = window.location.origin + '/watch/' + stream.name;
                                 html += `<div style="background: #383838; border-radius: 8px; padding: 15px; border: 1px solid #4a4a4a;">`;
                                 html += `<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">`;
@@ -3197,9 +3312,10 @@ HTML_TEMPLATE = '''
                                 if (groupDisplay) {
                                     html += `<div style="color: #4a9eff; font-size: 13px; margin-bottom: 10px;">${groupDisplay}</div>`;
                                 }
-                                html += `<div style="display: flex; gap: 10px;">`;
+                                html += `<div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">`;
+                                html += `<button class="share-mode-badge" data-stream-name="${escapeHtml(stream.name).replace(/'/g, "\\'")}" data-mode="${shareMode}" style="padding: 4px 10px; font-size: 12px; font-weight: bold; border-radius: 4px; border: none; cursor: pointer; background: ${shareMode === 'public' ? '#16a34a' : '#dc2626'}; color: #fff;" title="Link sharing: ${shareMode === 'public' ? 'Static link' : 'Token link'}. Click to toggle (admin).">${shareMode === 'public' ? 'Public' : 'Private'}</button>`;
                                 html += `<button class="watch-stream-btn" data-url="${stream.hls_url}" data-name="${escapeHtml(stream.name)}" data-stream-name="${stream.name}" style="flex: 1; padding: 12px; font-size: 15px; background: #4CAF50; color: white; border: none; border-radius: 6px; cursor: pointer;">▶️ Watch</button>`;
-                                html += `<button onclick="navigator.clipboard.writeText('${watchUrl}'); this.textContent='✅ Copied!'; this.style.background='#4CAF50'; setTimeout(() => { this.textContent='📋 Share'; this.style.background='#2196F3'; }, 2000);" style="padding: 12px 16px; font-size: 15px; background: #2196F3; color: white; border: none; border-radius: 6px; cursor: pointer; min-width: 100px;">📋 Share</button>`;
+                                html += `<button class="share-link-btn" data-stream-name="${escapeHtml(stream.name).replace(/'/g, "\\'")}" data-share-mode="${shareMode}" style="padding: 12px 16px; font-size: 15px; background: #2196F3; color: white; border: none; border-radius: 6px; cursor: pointer; min-width: 100px;">🔗 Share</button>`;
                                 html += `</div>`;
                                 html += `</div>`;
                             });
@@ -3216,6 +3332,7 @@ HTML_TEMPLATE = '''
                         html += '</tr></thead><tbody>';
                         
                         data.streams.forEach(stream => {
+                            const shareMode = stream.share_mode || 'private';
                             html += '<tr style="border-bottom: 1px solid #4a4a4a;">';
                             
                             // Group column
@@ -3226,8 +3343,8 @@ HTML_TEMPLATE = '''
                             let userDisplay = stream.publisher_username ? `@${stream.publisher_username}` : '<span style="color: #666;">-</span>';
                             html += `<td style="padding: 12px;"><span style="color: #999;">${userDisplay}</span></td>`;
                             
-                            // Stream name column
-                            html += `<td style="padding: 12px;"><strong>${stream.name}</strong></td>`;
+                            // Stream name column + share mode badge
+                            html += `<td style="padding: 12px;"><strong>${stream.name}</strong> <button class="share-mode-badge" data-stream-name="${escapeHtml(stream.name).replace(/'/g, "\\'")}" data-mode="${shareMode}" style="margin-left:8px;padding:2px 8px;font-size:11px;font-weight:bold;border-radius:4px;border:none;cursor:pointer;background:${shareMode === 'public' ? '#16a34a' : '#dc2626'};color:#fff;" title="Link sharing: ${shareMode === 'public' ? 'Static link' : 'Token link'}. Click to toggle (admin).">${shareMode === 'public' ? 'Public' : 'Private'}</button></td>`;
                             
                             // Show viewer count with breakdown
                             let viewerDisplay = `<strong style="color: #4caf50;">${stream.readers}</strong>`;
@@ -3243,8 +3360,7 @@ HTML_TEMPLATE = '''
                             html += `<td style="padding: 12px; text-align: center;">`;
                             html += `<button class="watch-stream-btn" data-url="${stream.hls_url}" data-name="${escapeHtml(stream.name)}" data-stream-name="${stream.name}" style="padding: 8px 16px; font-size: 14px; display: inline-flex; align-items: center; gap: 6px; background: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer;">`;
                             html += `<span style="font-size: 16px;">▶️</span> Watch</button>`;
-                            const watchUrl = window.location.origin + '/watch/' + stream.name;
-                            html += ` <button onclick="navigator.clipboard.writeText('${watchUrl}'); this.textContent='✅ Copied!'; this.style.background='#4CAF50'; setTimeout(() => { this.textContent='📋 Copy Link'; this.style.background='#2196F3'; }, 2000);" style="padding: 8px 16px; font-size: 14px; background: #2196F3; color: white; border: none; border-radius: 4px; cursor: pointer;">📋 Copy Link</button>`;
+                            html += ` <button class="share-link-btn" data-stream-name="${escapeHtml(stream.name).replace(/'/g, "\\'")}" data-share-mode="${shareMode}" style="padding: 8px 16px; font-size: 14px; background: #2196F3; color: white; border: none; border-radius: 4px; cursor: pointer;">🔗 Share</button>`;
                             html += `</td>`;
                             html += '</tr>';
                         });
@@ -3265,6 +3381,59 @@ HTML_TEMPLATE = '''
                                 } else {
                                     watchStream(this.getAttribute('data-url'));
                                 }
+                            });
+                        });
+                        // Share link (Active Streams): always generate a 4-hour token and copy (no modal)
+                        document.querySelectorAll('.share-link-btn').forEach(btn => {
+                            btn.addEventListener('click', function() {
+                                const streamName = this.getAttribute('data-stream-name');
+                                if (!streamName) return;
+                                const el = this;
+                                el.disabled = true;
+                                el.textContent = '…';
+                                fetch('/api/share-links/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ stream: streamName, ttl: 14400 }) })
+                                    .then(function(r) { return r.json(); })
+                                    .then(function(d) {
+                                        if (d.ok && d.url) {
+                                            navigator.clipboard.writeText(d.url).catch(function() {
+                                                var inp = document.createElement('input'); inp.value = d.url; document.body.appendChild(inp); inp.select(); document.execCommand('copy'); document.body.removeChild(inp);
+                                            });
+                                            el.textContent = '✅ Link copied (4h)';
+                                            el.style.background = '#16a34a';
+                                        } else {
+                                            el.textContent = '🔗 Share';
+                                            if (d.error) alert('Error: ' + d.error);
+                                        }
+                                        el.disabled = false;
+                                        setTimeout(function() { el.textContent = '🔗 Share'; el.style.background = '#2196F3'; }, 3000);
+                                    })
+                                    .catch(function() {
+                                        el.textContent = '🔗 Share';
+                                        el.disabled = false;
+                                        alert('Request failed');
+                                    });
+                            });
+                        });
+                        // Share mode toggle (Public/Private): admin only, only affects link sharing
+                        document.querySelectorAll('.share-mode-badge').forEach(btn => {
+                            btn.addEventListener('click', function() {
+                                const streamName = this.getAttribute('data-stream-name');
+                                const cur = this.getAttribute('data-mode') || 'private';
+                                const next = cur === 'public' ? 'private' : 'public';
+                                const row = this.closest('tr');
+                                const card = this.closest('div[style*="border-radius: 8px"]');
+                                const shareBtn = (row || card) ? (row || card).querySelector('.share-link-btn') : null;
+                                this.disabled = true;
+                                fetch('/api/share-mode', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ stream: streamName, mode: next }) })
+                                    .then(r => r.json()).then(d => {
+                                        if (d.ok) {
+                                            this.setAttribute('data-mode', next);
+                                            this.textContent = next === 'public' ? 'Public' : 'Private';
+                                            this.style.background = next === 'public' ? '#16a34a' : '#dc2626';
+                                            this.title = 'Link sharing: ' + (next === 'public' ? 'Static link' : 'Token link') + '. Click to toggle (admin).';
+                                            if (shareBtn) shareBtn.setAttribute('data-share-mode', next);
+                                        }
+                                    }).finally(() => { this.disabled = false; });
                             });
                         });
                     } else {
@@ -3293,7 +3462,14 @@ HTML_TEMPLATE = '''
                         const url = '${url}';
                         
                         if (Hls.isSupported()) {
-                            const hls = new Hls();
+                            const hls = new Hls({
+                                enableWorker: true,
+                                lowLatencyMode: false,
+                                maxBufferLength: 30,
+                                maxMaxBufferLength: 60,
+                                liveSyncDurationCount: 4,
+                                liveMaxLatencyDurationCount: 7
+                            });
                             hls.loadSource(url);
                             hls.attachMedia(video);
                         } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
@@ -4063,10 +4239,14 @@ HTML_TEMPLATE = '''
             document.getElementById('hls-source-fields').style.display = protocol === 'hls' ? 'block' : 'none';
         }
         
-        document.getElementById('external-source-form')?.addEventListener('submit', function(e) {
+        // Use delegation so submit is handled even if form was not in DOM when script ran (e.g. tab loaded later)
+        document.addEventListener('submit', function(e) {
+            if (!e.target || e.target.id !== 'external-source-form') return;
             e.preventDefault();
             
-            const name = document.getElementById('source-name').value.trim();
+            const nameEl = document.getElementById('source-name');
+            if (!nameEl) return;
+            const name = nameEl.value.trim();
             const protocol = document.getElementById('source-protocol').value;
             const alwaysOn = true;  // Always connected by default
             
@@ -4084,7 +4264,7 @@ HTML_TEMPLATE = '''
             let sourceUrl = '';
             
             if (protocol === 'srt') {
-                const host = document.getElementById('source-srt-host').value.trim();
+                let host = document.getElementById('source-srt-host').value.trim();
                 const port = document.getElementById('source-srt-port').value.trim() || '8890';
                 const srtMode = document.getElementById('source-srt-mode').value;
                 const streamId = document.getElementById('source-srt-streamid').value.trim();
@@ -4094,7 +4274,8 @@ HTML_TEMPLATE = '''
                     alert('SRT server address is required');
                     return;
                 }
-                
+                // Avoid double srt:// if user pasted full URL into host
+                host = host.replace(/^srt:\/\//i, '');
                 sourceUrl = 'srt://' + host + ':' + port;
                 let params = [];
                 if (streamId) {
@@ -4184,6 +4365,10 @@ HTML_TEMPLATE = '''
                     return;
                 }
             }
+            if (!sourceUrl) {
+                alert('Please fill in the source details for the selected protocol');
+                return;
+            }
             
             const endpoint = editingSourceName ? '/api/external-sources/edit' : '/api/external-sources/add';
             const successMsg = editingSourceName ? 'External source updated! MediaMTX will restart.' : 'External source added! MediaMTX will restart.';
@@ -4197,24 +4382,29 @@ HTML_TEMPLATE = '''
                     onDemand: !alwaysOn
                 })
             })
-            .then(response => response.json())
-            .then(data => {
+            .then(function(response) {
+                const ct = response.headers.get('content-type') || '';
+                if (!ct.includes('application/json')) {
+                    return response.text().then(function(t) { throw new Error('Server returned ' + response.status + (t ? ': ' + t.slice(0, 80) : '')); });
+                }
+                return response.json();
+            })
+            .then(function(data) {
                 if (data.success) {
                     hideAddSourceForm();
                     loadExternalSources();
                     reloadYAMLContent();
                     alert(successMsg);
                 } else {
-                    alert('Error: ' + data.error);
+                    alert('Error: ' + (data.error || 'Unknown error'));
                 }
             })
-            .catch(err => alert('Error: ' + err.message));
+            .catch(function(err) { alert('Error: ' + (err.message || String(err))); });
         });
         
         function loadExternalSources() {
-            fetch('/api/external-sources')
-                .then(response => response.json())
-                .then(data => {
+            Promise.all([fetch('/api/external-sources').then(r => r.json()), fetch('/api/share-mode').then(r => r.json()).catch(() => ({}))])
+                .then(([data, shareModeMap]) => {
                     const container = document.getElementById('external-sources-list');
                     
                     if (!data.sources || data.sources.length === 0) {
@@ -4233,16 +4423,19 @@ HTML_TEMPLATE = '''
                     html += '</tr></thead><tbody>';
                     
                     data.sources.forEach(source => {
+                        const shareMode = shareModeMap[source.name] || 'private';
                         html += '<tr style="border-bottom: 1px solid #4a4a4a;">';
-                        html += '<td style="padding: 12px;"><strong>' + escapeHtml(source.name) + '</strong></td>';
+                        html += '<td style="padding: 12px;"><strong>' + escapeHtml(source.name) + '</strong> <button class="share-mode-badge-ext" data-stream-name="' + escapeHtml(source.name).replace(/"/g, '&quot;') + '" data-mode="' + shareMode + '" style="margin-left:8px;padding:2px 8px;font-size:11px;font-weight:bold;border-radius:4px;border:none;cursor:pointer;background:' + (shareMode === 'public' ? '#16a34a' : '#dc2626') + ';color:#fff;" title="Link sharing: ' + (shareMode === 'public' ? 'Static' : 'Token') + '. Click to toggle (admin).">' + (shareMode === 'public' ? 'Public' : 'Private') + '</button></td>';
                         
                         // Clean URL display: mask passphrase and strip SRT tuning params
                         let displayUrl = source.source_url || '';
+                        if (displayUrl.indexOf('srt://srt://') === 0) displayUrl = displayUrl.replace(/^srt:\/\/+/, 'srt://');
                         displayUrl = displayUrl.replace(/passphrase=[^&]+/, 'passphrase=****');
                         displayUrl = displayUrl.replace(/&?(transtype|latency|peerlatency|rcvlatency|payloadsize|lossmaxttl|tlpktdrop|nakreport)=[^&]*/g, '');
                         displayUrl = displayUrl.replace(/\?&/, '?').replace(/&&+/g, '&').replace(/[?&]$/, '');
                         const watchLink = window.location.origin + '/watch/' + source.name;
-                        html += '<td style="padding: 12px; font-family: monospace; font-size: 13px; word-break: break-all;">' + escapeHtml(displayUrl) + ' <button onclick="navigator.clipboard.writeText(\\'' + watchLink + '\\'); this.textContent=\\'✅ Copied!\\'; setTimeout(() => this.textContent=\\'📋 Copy HLS Link\\', 2000);" style="background: #2196F3; color: white; border: none; border-radius: 4px; padding: 4px 10px; cursor: pointer; font-size: 12px; margin-left: 8px; white-space: nowrap;">📋 Copy HLS Link</button></td>';
+                        const linkBtnLabel = shareMode === 'public' ? '📋 Copy link' : '🔗 Generate Share Link';
+                        html += '<td style="padding: 12px; font-family: monospace; font-size: 13px; word-break: break-all;">' + escapeHtml(displayUrl) + ' <button class="external-copy-link-btn" data-stream-name="' + escapeHtml(source.name).replace(/"/g, '&quot;') + '" data-share-mode="' + shareMode + '" style="background: #2196F3; color: white; border: none; border-radius: 4px; padding: 4px 10px; cursor: pointer; font-size: 12px; margin-left: 8px; white-space: nowrap;">' + linkBtnLabel + '</button></td>';
                         
                         // Transport profile for SRT sources
                         if (source.source_url && source.source_url.startsWith('srt://')) {
@@ -4288,21 +4481,93 @@ HTML_TEMPLATE = '''
                         }
                         html += '<td style="padding: 12px; text-align: center;"><span style="color: ' + statusColor + '; font-weight: bold;">' + statusText + '</span></td>';
                         
-                        // Actions - Enable/Disable toggle + Edit + Delete
-                        html += '<td style="padding: 12px; text-align: center;">';
+                        // Actions - flex wrapper so buttons stay in a row (no jumbling)
+                        html += '<td style="padding: 12px; text-align: center; white-space: nowrap;"><div style="display: inline-flex; gap: 6px; flex-wrap: nowrap;">';
                         if (source.enabled !== false) {
-                            html += '<button class="btn" data-toggle-btn onclick="toggleExternalSource(\\'' + escapeHtml(source.name) + '\\')" style="padding: 6px 14px; font-size: 13px; background: #ff9800; color: white; border: none; border-radius: 4px; cursor: pointer; margin-right: 6px;">Disable</button>';
+                            html += '<button class="btn" data-toggle-btn onclick="toggleExternalSource(\\'' + escapeHtml(source.name) + '\\')" style="padding: 6px 14px; font-size: 13px; background: #ff9800; color: white; border: none; border-radius: 4px; cursor: pointer;">Disable</button>';
                         } else {
-                            html += '<button class="btn" data-toggle-btn onclick="toggleExternalSource(\\'' + escapeHtml(source.name) + '\\')" style="padding: 6px 14px; font-size: 13px; background: #4caf50; color: white; border: none; border-radius: 4px; cursor: pointer; margin-right: 6px;">Enable</button>';
+                            html += '<button class="btn" data-toggle-btn onclick="toggleExternalSource(\\'' + escapeHtml(source.name) + '\\')" style="padding: 6px 14px; font-size: 13px; background: #4caf50; color: white; border: none; border-radius: 4px; cursor: pointer;">Enable</button>';
                         }
-                        html += '<button class="btn" onclick="editExternalSource(\\'' + escapeHtml(source.name) + '\\')" style="padding: 6px 14px; font-size: 13px; background: #2196F3; color: white; border: none; border-radius: 4px; cursor: pointer; margin-right: 6px;">Edit</button>';
+                        var srcUrl = (source.source_url || '');
+                        if (srcUrl && srcUrl.indexOf('udp+mpegts://') !== 0) {
+                            var esc = srcUrl.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                            html += '<button class="btn simulator-for-source-btn" data-source-url="' + esc + '" style="padding: 6px 14px; font-size: 13px; background: #6d28d9; color: white; border: none; border-radius: 4px; cursor: pointer;" title="Set simulator to this source and turn ON">Simulate link</button>';
+                        }
+                        html += '<button class="btn" onclick="editExternalSource(\\'' + escapeHtml(source.name) + '\\')" style="padding: 6px 14px; font-size: 13px; background: #2196F3; color: white; border: none; border-radius: 4px; cursor: pointer;">Edit</button>';
                         html += '<button class="btn btn-danger" onclick="deleteExternalSource(\\'' + escapeHtml(source.name) + '\\')" style="padding: 6px 14px; font-size: 13px;">Delete</button>';
-                        html += '</td>';
+                        html += '</div></td>';
                         html += '</tr>';
                     });
                     
                     html += '</tbody></table>';
                     container.innerHTML = html;
+                    
+                    // Copy link (public) = static URL; Generate Share Link (private) = open modal to pick duration
+                    container.querySelectorAll('.external-copy-link-btn').forEach(btn => {
+                        btn.addEventListener('click', function() {
+                            const name = this.getAttribute('data-stream-name');
+                            const mode = this.getAttribute('data-share-mode') || 'private';
+                            const staticUrl = window.location.origin + '/watch/' + name;
+                            if (mode === 'public') {
+                                navigator.clipboard.writeText(staticUrl).catch(() => { const i = document.createElement('input'); i.value = staticUrl; document.body.appendChild(i); i.select(); document.execCommand('copy'); document.body.removeChild(i); });
+                                this.textContent = '✅ Copied!';
+                                setTimeout(() => this.textContent = '📋 Copy link', 2000);
+                                return;
+                            }
+                            openShareLinkModal(name);
+                        });
+                    });
+                    // Share mode toggle for external sources
+                    container.querySelectorAll('.share-mode-badge-ext').forEach(btn => {
+                        btn.addEventListener('click', function() {
+                            const name = this.getAttribute('data-stream-name');
+                            const cur = this.getAttribute('data-mode') || 'private';
+                            const next = cur === 'public' ? 'private' : 'public';
+                            const row = this.closest('tr');
+                            const copyBtn = row ? row.querySelector('.external-copy-link-btn') : null;
+                            this.disabled = true;
+                            fetch('/api/share-mode', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ stream: name, mode: next }) })
+                                .then(r => r.json()).then(d => {
+                                    if (d.ok) {
+                                        this.setAttribute('data-mode', next);
+                                        this.textContent = next === 'public' ? 'Public' : 'Private';
+                                        this.style.background = next === 'public' ? '#16a34a' : '#dc2626';
+                                        if (copyBtn) {
+                                            copyBtn.setAttribute('data-share-mode', next);
+                                            copyBtn.textContent = next === 'public' ? '📋 Copy link' : '🔗 Generate Share Link';
+                                        }
+                                    }
+                                }).finally(() => { this.disabled = false; });
+                        });
+                    });
+                    // Simulate link: set SOURCE_IP from this source and turn simulator ON
+                    container.querySelectorAll('.simulator-for-source-btn').forEach(btn => {
+                        btn.addEventListener('click', function() {
+                            const sourceUrl = this.getAttribute('data-source-url');
+                            if (!sourceUrl) return;
+                            this.disabled = true;
+                            const msgEl = document.getElementById('simulator-msg');
+                            if (msgEl) msgEl.textContent = 'Setting source and turning simulator ON...';
+                            fetch('/api/ku-band-simulator/on-for-source', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ sourceUrl: sourceUrl, interface: 'eth0' })
+                            })
+                            .then(function(r) { return r.json(); })
+                            .then(function(d) {
+                                if (msgEl) {
+                                    msgEl.textContent = d.ok ? (d.msg || 'Simulator ON for this source') : (d.error || 'Failed');
+                                    msgEl.style.color = d.ok ? '#16a34a' : '#dc2626';
+                                }
+                                if (d.ok && typeof window.showSimulatorOn === 'function') window.showSimulatorOn();
+                                if (!d.ok && d.error) alert('Error: ' + d.error);
+                            })
+                            .catch(function() {
+                                if (msgEl) { msgEl.textContent = 'Request failed'; msgEl.style.color = '#dc2626'; }
+                            })
+                            .finally(function() { btn.disabled = false; });
+                        });
+                    });
                 })
                 .catch(err => {
                     document.getElementById('external-sources-list').innerHTML = '<p style="color: #f44336;">Error loading sources: ' + err.message + '</p>';
@@ -4412,14 +4677,18 @@ HTML_TEMPLATE = '''
                     const submitBtn = document.querySelector('#external-source-form button[type="submit"]');
                     if (submitBtn) submitBtn.textContent = 'Save Changes';
                     
-                    const url = source.source_url || '';
+                    let url = source.source_url || '';
+                    // Normalize double srt:// so parse and display are correct
+                    if (url.startsWith('srt://')) {
+                        url = url.replace(/^srt:\/\/+/, 'srt://');
+                    }
                     
                     // Detect protocol and fill fields
                     if (url.startsWith('srt://')) {
                         document.getElementById('source-protocol').value = 'srt';
                         updateSourceFormFields();
                         // Parse srt://host:port?params
-                        const srtMatch = url.match(/srt:\\/\\/([^:]+):(\\d+)/);
+                        const srtMatch = url.match(/srt:\/\/([^:]+):(\d+)/);
                         if (srtMatch) {
                             document.getElementById('source-srt-host').value = srtMatch[1];
                             document.getElementById('source-srt-port').value = srtMatch[2];
@@ -4884,8 +5153,11 @@ HTML_TEMPLATE = '''
                             if (Hls.isSupported()) {
                                 const hls = new Hls({
                                     enableWorker: true,
-                                    lowLatencyMode: true,
-                                    backBufferLength: 90,
+                                    lowLatencyMode: false,
+                                    maxBufferLength: 30,
+                                    maxMaxBufferLength: 60,
+                                    liveSyncDurationCount: 4,
+                                    liveMaxLatencyDurationCount: 7,
                                     xhrSetup: function(xhr, url) {
                                         // Add Basic Auth header
                                         const credentials = btoa(username + ':' + password);
@@ -6364,7 +6636,63 @@ HTML_TEMPLATE = '''
         // === END LOGO FUNCTIONS ===
         
         // === END THEME FUNCTIONS ===
+        
+        // === Generate Share Link modal (private streams: pick duration then generate) ===
+        function openShareLinkModal(streamName) {
+            var el = document.getElementById('share-link-modal-stream');
+            var nameEl = document.getElementById('share-link-modal-stream-name');
+            if (el) el.value = streamName || '';
+            if (nameEl) nameEl.textContent = streamName || '';
+            var bg = document.getElementById('share-link-modal-bg');
+            if (bg) bg.style.display = 'flex';
+        }
+        function closeShareLinkModal() {
+            var bg = document.getElementById('share-link-modal-bg');
+            if (bg) bg.style.display = 'none';
+        }
+        function generateShareLinkFromModal() {
+            var stream = (document.getElementById('share-link-modal-stream') || {}).value;
+            var sel = document.getElementById('share-link-modal-ttl');
+            var ttl = sel ? parseInt(sel.value, 10) : 14400;
+            if (!stream) return;
+            var btn = document.getElementById('share-link-modal-generate-btn');
+            if (btn) { btn.disabled = true; btn.textContent = 'Generating...'; }
+            fetch('/api/share-links/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ stream: stream, ttl: ttl }) })
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    if (d.ok && d.url) {
+                        navigator.clipboard.writeText(d.url).catch(function() {
+                            var inp = document.createElement('input'); inp.value = d.url; document.body.appendChild(inp); inp.select(); document.execCommand('copy'); document.body.removeChild(inp);
+                        });
+                        if (btn) { btn.textContent = 'Link copied!'; btn.style.background = '#16a34a'; setTimeout(function() { btn.disabled = false; btn.textContent = 'Generate Link'; btn.style.background = ''; }, 1500); }
+                        closeShareLinkModal();
+                    } else {
+                        if (btn) { btn.disabled = false; btn.textContent = 'Generate Link'; alert(d.error || 'Failed'); }
+                    }
+                })
+                .catch(function() {
+                    if (btn) { btn.disabled = false; btn.textContent = 'Generate Link'; alert('Request failed'); }
+                });
+        }
     </script>
+    <div id="share-link-modal-bg" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:9999;align-items:center;justify-content:center;">
+        <div style="background:#1e1e1e;border:1px solid #333;border-radius:12px;padding:24px;width:420px;max-width:90vw;">
+            <h3 style="font-size:16px;font-weight:600;margin-bottom:8px;display:flex;align-items:center;gap:8px;"><span style="font-size:20px;">&#128279;</span> Generate Share Link</h3>
+            <p style="font-size:13px;color:#888;margin-bottom:16px;"><span id="share-link-modal-stream-name"></span> – Private Stream</p>
+            <input type="hidden" id="share-link-modal-stream" value="">
+            <label style="display:block;font-size:12px;font-weight:600;color:#888;margin-bottom:6px;text-transform:uppercase;">Link expires in</label>
+            <select id="share-link-modal-ttl" style="width:100%;background:#0e0e0e;border:1px solid #333;border-radius:6px;padding:10px 12px;color:#e0e0e0;font-size:13px;margin-bottom:20px;">
+                <option value="3600">1 hour</option>
+                <option value="14400" selected>4 hours</option>
+                <option value="86400">24 hours</option>
+                <option value="0">Until revoked</option>
+            </select>
+            <div style="display:flex;gap:10px;justify-content:flex-end;">
+                <button type="button" onclick="closeShareLinkModal()" style="padding:8px 18px;border-radius:6px;font-size:13px;background:#2a2a2a;color:#888;border:none;cursor:pointer;">Close</button>
+                <button type="button" id="share-link-modal-generate-btn" onclick="generateShareLinkFromModal()" style="padding:8px 18px;border-radius:6px;font-size:13px;background:#2196F3;color:#fff;border:none;cursor:pointer;">Generate Link</button>
+            </div>
+        </div>
+    </div>
 </body>
 </html>
 '''
@@ -7262,6 +7590,8 @@ def api_streams():
                     # Generate HLS URL - use https only if hlsEncryption is enabled
                     hls_protocol = 'https' if hls_encryption_on else 'http'
                     stream_info['hls_url'] = f"{hls_protocol}://{hls_domain}:8888/{path_name}/index.m3u8"
+                    # Share mode: public = static /watch/ link, private = token link (only affects link sharing)
+                    stream_info['share_mode'] = load_share_mode().get(path_name, 'private')
                     
                     # Only add streams that are ready (have an active source)
                     # External sources (pull) only show when ready (actually receiving video)
@@ -9127,7 +9457,14 @@ def play_recording(filename):
         var videoSrc = '{hls_url}';
         
         if (Hls.isSupported()) {{
-            var hls = new Hls();
+            var hls = new Hls({{
+                enableWorker: true,
+                lowLatencyMode: false,
+                maxBufferLength: 30,
+                maxMaxBufferLength: 60,
+                liveSyncDurationCount: 4,
+                liveMaxLatencyDurationCount: 7
+            }});
             hls.loadSource(videoSrc);
             hls.attachMedia(video);
             hls.on(Hls.Events.MANIFEST_PARSED, function() {{
@@ -10775,7 +11112,290 @@ def api_edit_external_source():
         print(f"ERROR editing external source: {e}", flush=True)
         return jsonify({'success': False, 'error': str(e)}), 500
 
+
+def _get_default_network_interface():
+    """Return the default route interface (e.g. ens3, eth0). Used when eth0 does not exist (common on cloud VPS)."""
+    try:
+        r = subprocess.run(
+            ['ip', '-o', 'route', 'get', '8.8.8.8'],
+            capture_output=True, text=True, timeout=5
+        )
+        if r.returncode == 0 and r.stdout:
+            m = re.search(r'\bdev\s+(\S+)', r.stdout)
+            if m:
+                return m.group(1).strip()
+        r = subprocess.run(
+            ['ip', '-o', 'link', 'show'],
+            capture_output=True, text=True, timeout=5
+        )
+        if r.returncode == 0 and r.stdout:
+            for line in r.stdout.splitlines():
+                m = re.match(r'^\d+:\s+(\S+):', line)
+                if m and m.group(1) != 'lo' and not m.group(1).startswith('ifb'):
+                    return m.group(1).strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+@app.route('/api/ku-band-simulator/on', methods=['POST'])
+@admin_required
+def api_ku_band_simulator_on():
+    """Run Ku-band simulator ON script (impairs incoming traffic from source). Requires sudo for scripts."""
+    return _run_simulator_script('on')
+
+
+@app.route('/api/ku-band-simulator/on-for-source', methods=['POST'])
+@admin_required
+def api_ku_band_simulator_on_for_source():
+    """Set SOURCE_IP from source URL (resolve host to IP), write ku_band_simulator.conf, then run simulator ON.
+    JSON: { "sourceUrl": "srt://host:8890?...", "interface": "eth0" } (interface optional; auto-detect if eth0 missing)."""
+    try:
+        data = request.get_json() or {}
+        source_url = (data.get('sourceUrl') or '').strip()
+        interface = (data.get('interface') or '').strip() or 'eth0'
+        # On many VPS the default interface is ens3, ens18, etc. If eth0 doesn't exist, use default route interface.
+        if interface == 'eth0':
+            r = subprocess.run(['ip', 'link', 'show', 'eth0'], capture_output=True, timeout=3)
+            if r.returncode != 0:
+                detected = _get_default_network_interface()
+                if detected:
+                    interface = detected
+                else:
+                    return jsonify({'ok': False, 'error': 'Could not detect network interface (no eth0). Set interface in ku_band_simulator.conf or pass "interface" in the request.'}), 400
+        if not source_url:
+            return jsonify({'ok': False, 'error': 'sourceUrl is required'}), 400
+        # Parse host from URL (srt, rtsp, rtmp, http(s))
+        parsed = urlparse(source_url if '://' in source_url else '//' + source_url)
+        host = (parsed.hostname or parsed.netloc or '').split(':')[0].strip()
+        if not host or host in ('0.0.0.0', 'localhost', '127.0.0.1'):
+            return jsonify({'ok': False, 'error': 'Could not get remote host from URL (UDP/listener sources have no remote host)'}), 400
+        try:
+            source_ip = socket.gethostbyname(host)
+        except socket.gaierror as e:
+            return jsonify({'ok': False, 'error': f'Could not resolve {host}: {e}'}), 400
+        conf_path = os.path.join(SIMULATOR_DIR, 'ku_band_simulator.conf')
+        example_path = os.path.join(SIMULATOR_DIR, 'ku_band_simulator.conf.example')
+        if not os.path.isfile(conf_path) and os.path.isfile(example_path):
+            with open(example_path, 'r') as f:
+                conf_content = f.read()
+            conf_content = re.sub(r'^SOURCE_IP=.*', f'SOURCE_IP={source_ip}', conf_content, flags=re.MULTILINE)
+            conf_content = re.sub(r'^INTERFACE=.*', f'INTERFACE={interface}', conf_content, flags=re.MULTILINE)
+            try:
+                with open(conf_path, 'w') as f:
+                    f.write(conf_content)
+            except PermissionError:
+                return jsonify({'ok': False, 'error': f'Cannot write {conf_path} (permission denied)'}), 500
+        else:
+            # Update existing conf: set SOURCE_IP and INTERFACE
+            if os.path.isfile(conf_path):
+                with open(conf_path, 'r') as f:
+                    conf_content = f.read()
+                conf_content = re.sub(r'^SOURCE_IP=.*', f'SOURCE_IP={source_ip}', conf_content, flags=re.MULTILINE)
+                conf_content = re.sub(r'^INTERFACE=.*', f'INTERFACE={interface}', conf_content, flags=re.MULTILINE)
+                with open(conf_path, 'w') as f:
+                    f.write(conf_content)
+            else:
+                with open(conf_path, 'w') as f:
+                    f.write(f'# Auto-generated for source\nSOURCE_IP={source_ip}\nINTERFACE={interface}\n')
+        return _run_simulator_script('on')
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+@app.route('/api/ku-band-simulator/off', methods=['POST'])
+@admin_required
+def api_ku_band_simulator_off():
+    """Run Ku-band simulator OFF script."""
+    return _run_simulator_script('off')
+
+
+def _run_simulator_script(action):
+    on_script = os.path.join(SIMULATOR_DIR, 'ku_band_simulator_on.sh')
+    off_script = os.path.join(SIMULATOR_DIR, 'ku_band_simulator_off.sh')
+    script = on_script if action == 'on' else off_script
+    if not os.path.isfile(script):
+        return jsonify({'ok': False, 'error': f'Simulator script not found: {script}. Copy scripts to {SIMULATOR_DIR} (or set MEDIAMTX_SIMULATOR_DIR).'}), 404
+    try:
+        out = subprocess.run(
+            ['sudo', 'bash', script],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            cwd=SIMULATOR_DIR,
+        )
+        msg = (out.stdout + out.stderr).strip() or ('OK' if out.returncode == 0 else 'Failed')
+        if out.returncode != 0:
+            return jsonify({'ok': False, 'error': msg}), 500
+        return jsonify({'ok': True, 'msg': msg})
+    except subprocess.TimeoutExpired:
+        return jsonify({'ok': False, 'error': 'Script timed out'}), 500
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
 # === END EXTERNAL SOURCES ENDPOINTS ===
+
+# === SHARE LINKS (token-based, no-login stream sharing) ===
+
+SHARED_EXPIRED_HTML = '''<!DOCTYPE html>
+<html><head><title>Link Expired</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#121212;color:#e0e0e0;font-family:'Segoe UI',system-ui,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;text-align:center}
+.box{max-width:400px;padding:40px}.icon{font-size:48px;margin-bottom:16px}h1{font-size:22px;margin-bottom:8px}p{color:#888;font-size:14px;line-height:1.6}</style></head>
+<body><div class="box"><div class="icon">&#x1F512;</div><h1>Link Expired or Revoked</h1><p>This shared stream link is no longer valid. Contact the administrator for a new link.</p></div></body></html>'''
+
+@app.route('/shared/<token>')
+def shared_stream_page(token):
+    """Share link: exact player from infra-TAK overlay (worked there)."""
+    links = prune_expired_share_links(load_share_links())
+    save_share_links(links)
+    info = links.get(token)
+    if not info:
+        return Response(SHARED_EXPIRED_HTML, content_type='text/html', status=404)
+    stream = info['stream']
+    hls_url = f'/shared-hls/{token}/{stream}/index.m3u8'
+    from html import escape as html_escape
+    stream_safe = html_escape(stream, quote=True)
+    # URL safe for JS: overlay used url="{hls_url}", we use json.dumps so quotes in path don't break
+    url_js = json.dumps(hls_url)
+    html = f'''<!DOCTYPE html>
+<html><head><title>{stream_safe} - Live</title>
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
+<style>*{{margin:0;padding:0}}body{{background:#000;overflow:hidden;font-family:sans-serif}}
+#v{{width:100vw;height:100vh;object-fit:contain}}
+#err{{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.95);
+z-index:100;justify-content:center;align-items:center;flex-direction:column;text-align:center;color:#fff}}
+#err h2{{font-size:1.4rem;margin-bottom:8px}}#err p{{color:#999;font-size:.9rem}}</style>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script></head><body>
+<video id="v" controls autoplay muted playsinline></video>
+<div id="err"><h2>Stream Offline</h2><p>Waiting for stream\u2026 auto-reconnecting.</p></div>
+<script>
+var video=document.getElementById("v"),err=document.getElementById("err"),url={url_js};
+function start(){{
+if(Hls.isSupported()){{var hls=new Hls({{enableWorker:true,lowLatencyMode:false,maxBufferLength:30,maxMaxBufferLength:60,liveSyncDurationCount:4,liveMaxLatencyDurationCount:7}});
+hls.loadSource(url);hls.attachMedia(video);
+hls.on(Hls.Events.MANIFEST_PARSED,function(){{err.style.display="none";video.play().catch(function(){{}});}});
+hls.on(Hls.Events.ERROR,function(ev,data){{if(data.fatal){{err.style.display="flex";setTimeout(function(){{hls.destroy();start();}},5000);}}}});
+}}else if(video.canPlayType("application/vnd.apple.mpegurl")){{video.src=url;video.addEventListener("loadedmetadata",function(){{video.play().catch(function(){{}});}});}}
+}}
+start();
+</script></body></html>'''
+    return Response(html, content_type='text/html')
+
+@app.route('/shared-hls/<token>/<path:subpath>')
+def shared_hls_proxy(token, subpath):
+    """Proxy HLS for shared link: validate token then stream from MediaMTX."""
+    links = load_share_links()
+    info = links.get(token)
+    if not info:
+        return 'Link expired or revoked', 403
+    if info.get('expires') and info['expires'] < time.time():
+        return 'Link expired', 403
+    if not subpath.startswith(info['stream']):
+        return 'Forbidden', 403
+    try:
+        data, ct = hls_fetch_for_share(subpath)
+        r = Response(data, content_type=ct)
+        r.headers['Cache-Control'] = 'no-cache'
+        return r
+    except Exception as e:
+        return str(e)[:200], 502
+
+@app.route('/api/share-mode')
+@login_required
+def api_share_mode_get():
+    """Get per-stream share mode (public = static link, private = token link)."""
+    if session.get('role') not in ('admin', 'viewer'):
+        return jsonify({'error': 'Unauthorized'}), 403
+    return jsonify(load_share_mode())
+
+@app.route('/api/share-mode', methods=['POST'])
+@login_required
+def api_share_mode_set():
+    """Set share mode for a stream (admin only)."""
+    if session.get('role') != 'admin':
+        return jsonify({'error': 'Unauthorized'}), 403
+    try:
+        data = request.get_json() or {}
+        stream = (data.get('stream') or '').strip()
+        mode = (data.get('mode') or 'private').strip().lower()
+        if not stream:
+            return jsonify({'error': 'Stream name required'}), 400
+        if mode not in ('public', 'private'):
+            return jsonify({'error': 'Mode must be public or private'}), 400
+        sm = load_share_mode()
+        sm[stream] = mode
+        save_share_mode(sm)
+        return jsonify({'ok': True, 'stream': stream, 'mode': mode})
+    except Exception as e:
+        return jsonify({'error': str(e)[:200]}), 500
+
+@app.route('/api/share-links')
+@login_required
+def api_share_links_list():
+    """List share links (admin and viewer)."""
+    if session.get('role') not in ('admin', 'viewer'):
+        return jsonify({'error': 'Unauthorized'}), 403
+    links = prune_expired_share_links(load_share_links())
+    save_share_links(links)
+    result = []
+    for tok, info in links.items():
+        result.append({
+            'token': tok,
+            'stream': info.get('stream', ''),
+            'created': info.get('created', ''),
+            'created_by': info.get('created_by', ''),
+            'expires': info.get('expires'),
+            'ttl_label': info.get('ttl_label', ''),
+        })
+    return jsonify({'links': result})
+
+@app.route('/api/share-links/generate', methods=['POST'])
+@login_required
+def api_share_links_generate():
+    """Create a share link (admin and viewer)."""
+    if session.get('role') not in ('admin', 'viewer'):
+        return jsonify({'error': 'Unauthorized'}), 403
+    try:
+        data = request.get_json() or {}
+        stream = (data.get('stream') or '').strip()
+        ttl = data.get('ttl', 0)
+        if not stream:
+            return jsonify({'error': 'Stream name required'}), 400
+        token = secrets.token_urlsafe(24)
+        now = time.time()
+        expires = now + int(ttl) if ttl else None
+        ttl_labels = {0: 'Until revoked', 3600: '1 hour', 14400: '4 hours', 86400: '24 hours'}
+        ttl_label = ttl_labels.get(int(ttl) if ttl else 0, f'{int(ttl)//3600}h' if ttl else 'Until revoked')
+        links = prune_expired_share_links(load_share_links())
+        links[token] = {
+            'stream': stream,
+            'created': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now)),
+            'created_by': session.get('username', 'admin'),
+            'expires': expires,
+            'ttl_label': ttl_label,
+        }
+        save_share_links(links)
+        share_url = f'{request.scheme}://{request.host}/shared/{token}'
+        return jsonify({'ok': True, 'token': token, 'url': share_url, 'stream': stream, 'ttl_label': ttl_label})
+    except Exception as e:
+        return jsonify({'error': str(e)[:200]}), 500
+
+@app.route('/api/share-links/revoke', methods=['POST'])
+@admin_required
+def api_share_links_revoke():
+    """Revoke a share link (admin only)."""
+    try:
+        data = request.get_json() or {}
+        token = (data.get('token') or '').strip()
+        if not token:
+            return jsonify({'error': 'Token required'}), 400
+        links = load_share_links()
+        if token in links:
+            del links[token]
+            save_share_links(links)
+        return jsonify({'ok': True})
+    except Exception as e:
+        return jsonify({'error': str(e)[:200]}), 500
 
 # === SHAREABLE WATCH LINKS ===
 
@@ -10862,17 +11482,30 @@ def watch_stream(stream_name):
         }}
         video.addEventListener('playing', requestWakeLock);
         
+        let hlsRef = null;
+        let stallCheck = null;
+        let lastCt = -1;
+        let lastAdv = 0;
+        // Conservative recovery when source loops: check every 5s, reload only if stuck 15s (avoids stutter from aggressive 2s/8s)
         function startPlayer() {{
+            if (stallCheck) {{ clearInterval(stallCheck); stallCheck = null; }}
+            if (hlsRef) {{ hlsRef.destroy(); hlsRef = null; }}
+            lastCt = -1;
+            lastAdv = Date.now();
             if (Hls.isSupported()) {{
                 const hls = new Hls({{
                     enableWorker: true,
-                    lowLatencyMode: true,
-                    backBufferLength: 90,
+                    lowLatencyMode: false,
+                    maxBufferLength: 30,
+                    maxMaxBufferLength: 60,
+                    liveSyncDurationCount: 4,
+                    liveMaxLatencyDurationCount: 7,
                     xhrSetup: function(xhr, url) {{
                         const credentials = btoa(username + ':' + password);
                         xhr.setRequestHeader('Authorization', 'Basic ' + credentials);
                     }}
                 }});
+                hlsRef = hls;
                 hls.loadSource(streamUrl);
                 hls.attachMedia(video);
                 hls.on(Hls.Events.MANIFEST_PARSED, () => {{
@@ -10882,13 +11515,28 @@ def watch_stream(stream_name):
                 hls.on(Hls.Events.ERROR, (event, data) => {{
                     if (data.fatal) {{
                         errorOverlay.style.display = 'flex';
-                        // Auto-retry every 5 seconds
                         setTimeout(() => {{
                             hls.destroy();
+                            hlsRef = null;
                             startPlayer();
                         }}, 5000);
                     }}
                 }});
+                stallCheck = setInterval(function() {{
+                    if (!hlsRef || !video.src) return;
+                    const t = video.currentTime;
+                    const now = Date.now();
+                    if (!video.paused && video.readyState >= 2) {{
+                        if (t !== lastCt) {{ lastCt = t; lastAdv = now; }}
+                        else if ((now - lastAdv) / 1000 >= 15) {{
+                            clearInterval(stallCheck);
+                            stallCheck = null;
+                            hls.destroy();
+                            hlsRef = null;
+                            startPlayer();
+                        }}
+                    }} else {{ lastCt = t; lastAdv = now; }}
+                }}, 5000);
             }} else if (video.canPlayType('application/vnd.apple.mpegurl')) {{
                 video.src = streamUrl;
                 video.addEventListener('loadedmetadata', () => {{

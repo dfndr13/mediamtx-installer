@@ -1,0 +1,11 @@
+# Copy to ku_band_simulator.conf and set values.
+# SOURCE_IP = IP of the MediaMTX that SENDS the stream (the one you pull from as external source).
+# INTERFACE = network interface on this (receiver) host where that traffic arrives (e.g. eth0, ens18).
+
+SOURCE_IP=192.168.1.100
+INTERFACE=eth0
+
+# Optional: tune impairment (defaults in _on.sh)
+# DELAY_MS=600
+# JITTER_MS=100
+# LOSS_PCT=1

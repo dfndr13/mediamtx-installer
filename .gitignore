@@ -1,0 +1,2 @@
+# Ku-band simulator local config (has SOURCE_IP)
+scripts/ku-band-simulator/ku_band_simulator.conf
