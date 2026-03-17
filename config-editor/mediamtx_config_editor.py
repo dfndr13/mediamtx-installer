@@ -24,7 +24,7 @@ app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)  # Generate secure secret key
 
 # Version - used by auto-update checker
-CURRENT_VERSION = "v1.1.8"
+CURRENT_VERSION = "v1.1.9"
 GITHUB_REPO = "takwerx/mediamtx-installer"
 GITHUB_RAW_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/config-editor/mediamtx_config_editor.py"
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -3467,8 +3467,10 @@ HTML_TEMPLATE = '''
                                 lowLatencyMode: false,
                                 maxBufferLength: 30,
                                 maxMaxBufferLength: 60,
-                                liveSyncDurationCount: 4,
-                                liveMaxLatencyDurationCount: 7
+                                liveSyncDurationCount: 5,
+                                liveMaxLatencyDurationCount: 7,
+                                liveBackBufferLength: 30,
+                                liveDurationInfinity: true
                             });
                             hls.loadSource(url);
                             hls.attachMedia(video);
@@ -4149,8 +4151,8 @@ HTML_TEMPLATE = '''
                 label: 'Internet / LAN', desc: 'Default SRT settings. Low latency buffer (120ms), suitable for reliable networks with <50ms round-trip.'},
             'cellular': {latency: 500, peerlatency: 500, rcvlatency: 500, payloadsize: 1316, lossmaxttl: 10, tlpktdrop: true, nakreport: true,
                 label: 'Cellular / 4G-5G', desc: 'Moderate latency buffer (500ms) for mobile/cellular connections. Handles jitter and intermittent loss typical of wireless networks.'},
-            'satellite': {latency: 2000, peerlatency: 2000, rcvlatency: 2000, payloadsize: 1316, lossmaxttl: 30, tlpktdrop: true, nakreport: true,
-                label: 'Satellite (KU/KA Band)', desc: 'High latency buffer (2000ms) for geostationary satellite links (~1200ms round-trip). If video is still choppy, try Custom and increase latency to 3000ms.'}
+            'satellite': {latency: 4000, peerlatency: 4000, rcvlatency: 4000, payloadsize: 1316, lossmaxttl: 30, tlpktdrop: true, nakreport: true,
+                label: 'Satellite (KU/KA Band)', desc: 'High latency buffer (4000ms) for geostationary satellite links. Tested on live KU-band ISR feeds. If video is still choppy, try Custom and increase latency to 6000ms.'}
         };
         
         function updateSrtProfile() {
@@ -5156,8 +5158,10 @@ HTML_TEMPLATE = '''
                                     lowLatencyMode: false,
                                     maxBufferLength: 30,
                                     maxMaxBufferLength: 60,
-                                    liveSyncDurationCount: 4,
+                                    liveSyncDurationCount: 5,
                                     liveMaxLatencyDurationCount: 7,
+                                    liveBackBufferLength: 30,
+                                    liveDurationInfinity: true,
                                     xhrSetup: function(xhr, url) {
                                         // Add Basic Auth header
                                         const credentials = btoa(username + ':' + password);
@@ -9462,8 +9466,10 @@ def play_recording(filename):
                 lowLatencyMode: false,
                 maxBufferLength: 30,
                 maxMaxBufferLength: 60,
-                liveSyncDurationCount: 4,
-                liveMaxLatencyDurationCount: 7
+                liveSyncDurationCount: 5,
+                liveMaxLatencyDurationCount: 7,
+                liveBackBufferLength: 30,
+                liveDurationInfinity: true
             }});
             hls.loadSource(videoSrc);
             hls.attachMedia(video);
@@ -11271,7 +11277,7 @@ z-index:100;justify-content:center;align-items:center;flex-direction:column;text
 <script>
 var video=document.getElementById("v"),err=document.getElementById("err"),url={url_js};
 function start(){{
-if(Hls.isSupported()){{var hls=new Hls({{enableWorker:true,lowLatencyMode:false,maxBufferLength:30,maxMaxBufferLength:60,liveSyncDurationCount:4,liveMaxLatencyDurationCount:7}});
+if(Hls.isSupported()){{var hls=new Hls({{enableWorker:true,lowLatencyMode:false,maxBufferLength:30,maxMaxBufferLength:60,liveSyncDurationCount:5,liveMaxLatencyDurationCount:7,liveBackBufferLength:30,liveDurationInfinity:true}});
 hls.loadSource(url);hls.attachMedia(video);
 hls.on(Hls.Events.MANIFEST_PARSED,function(){{err.style.display="none";video.play().catch(function(){{}});}});
 hls.on(Hls.Events.ERROR,function(ev,data){{if(data.fatal){{err.style.display="flex";setTimeout(function(){{hls.destroy();start();}},5000);}}}});
@@ -11498,8 +11504,10 @@ def watch_stream(stream_name):
                     lowLatencyMode: false,
                     maxBufferLength: 30,
                     maxMaxBufferLength: 60,
-                    liveSyncDurationCount: 4,
+                    liveSyncDurationCount: 5,
                     liveMaxLatencyDurationCount: 7,
+                    liveBackBufferLength: 30,
+                    liveDurationInfinity: true,
                     xhrSetup: function(xhr, url) {{
                         const credentials = btoa(username + ':' + password);
                         xhr.setRequestHeader('Authorization', 'Basic ' + credentials);
