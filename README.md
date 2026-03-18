@@ -63,7 +63,7 @@ This re-syncs the LDAP overlay and restarts the editor. **v2.0.1** fixes this at
 - ✅ Firewall configuration (UFW)
 - ✅ systemd service with auto-start
 
-### 🎨 Web Configuration Editor (v2.0.1)
+### 🎨 Web Configuration Editor (v2.0.2)
 - ✅ **HLS Tuning page** — Segment count, duration, variant, always remux, write queue — all from the browser
 - ✅ **HLS presets** — One-click LAN, Internet, and Satellite (KU/KA) profiles
 - ✅ **MPEG-TS demux toggle** — Enable/disable RTSP MPEG-TS unwrapping from the UI (no YAML editing)
@@ -111,13 +111,14 @@ mediamtx-installer/
 │   └── Ubuntu_22.04_Install_MediaMTX_Caddy.sh    # SSL/Let's Encrypt setup
 ├── config-editor/
 │   ├── Install_MediaMTX_Config_Editor.sh          # Web editor installer (universal)
-│   └── mediamtx_config_editor.py                  # Web editor application (v2.0.1)
+│   └── mediamtx_config_editor.py                  # Web editor application (v2.0.2)
 ├── scripts/
 │   └── ku-band-simulator/                         # Ku-band link simulator (delay/jitter/loss)
 ├── MEDIAMTX-DEPLOYMENT-GUIDE.md                   # Complete deployment guide
 ├── MEDIAMTX-QUICK-START.md                        # Fast deployment instructions
 ├── RELEASE-v2.0.0.md                               # Web Editor v2.0.0 release notes
 ├── RELEASE-v2.0.1.md                               # v2.0.1 infra-TAK overlay fix
+├── RELEASE-v2.0.2.md                               # v2.0.2 auto-cleanup & UX fixes
 └── README.md                                      # This file
 ```
 
@@ -282,7 +283,7 @@ If these scripts helped you deploy a streaming server, please star this reposito
 ---
 
 **Latest Update:** March 2026  
-**Web Editor:** v2.0.1  
+**Web Editor:** v2.0.2  
 **Script Version:** 2.0  
 **Compatible with:** MediaMTX v1.17.0+ (auto-downloads latest)  
 **Tested on:** Ubuntu 22.04 LTS

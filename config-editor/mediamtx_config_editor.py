@@ -24,7 +24,7 @@ app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)  # Generate secure secret key
 
 # Version - used by auto-update checker
-CURRENT_VERSION = "v2.0.1"
+CURRENT_VERSION = "v2.0.2"
 GITHUB_REPO = "takwerx/mediamtx-installer"
 GITHUB_RAW_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/config-editor/mediamtx_config_editor.py"
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
