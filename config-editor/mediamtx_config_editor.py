@@ -24,7 +24,7 @@ app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)  # Generate secure secret key
 
 # Version - used by auto-update checker
-CURRENT_VERSION = "v2.0.2"
+CURRENT_VERSION = "v2.0.3"
 GITHUB_REPO = "takwerx/mediamtx-installer"
 GITHUB_RAW_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/config-editor/mediamtx_config_editor.py"
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -11978,6 +11978,23 @@ if __name__ == '__main__':
             print("✓ Removed legacy FFmpeg ~^live/(.+)$ path from mediamtx.yml (no longer needed with MPEG-TS demuxing)")
     except Exception as e:
         print(f"Warning: Could not remove legacy FFmpeg path: {e}")
+
+    # Auto-patch: Ensure rtspDemuxMpegts is enabled under pathDefaults
+    # Without this, RTSP sources wrapping H264 in MPEG-TS (TAKICU, drones, ISR)
+    # show as "1 track (MPEG-TS)" and HLS playback fails.
+    try:
+        with open(CONFIG_FILE, 'r') as f:
+            content = f.read()
+        if 'rtspDemuxMpegts' not in content:
+            if 'pathDefaults:' in content:
+                content = content.replace('pathDefaults:', 'pathDefaults:\n  rtspDemuxMpegts: true', 1)
+            elif 'paths:' in content:
+                content = content.replace('paths:', 'pathDefaults:\n  rtspDemuxMpegts: true\n\npaths:', 1)
+            with open(CONFIG_FILE, 'w') as f:
+                f.write(content)
+            print("✓ Added rtspDemuxMpegts: true to pathDefaults (MPEG-TS unwrapping for RTSP sources)")
+    except Exception as e:
+        print(f"Warning: Could not add rtspDemuxMpegts: {e}")
 
     # Detect infra-TAK LDAP overlay
     overlay_file = '/opt/mediamtx-webeditor/mediamtx_ldap_overlay.py'
