@@ -9917,12 +9917,11 @@ def list_webeditor_backups():
             version = 'unknown'
             try:
                 with open(backup_path, 'r') as f:
-                    for line in f:
+                    for i, line in enumerate(f):
                         if line.strip().startswith('CURRENT_VERSION'):
                             version = line.split('=')[1].strip().strip('"').strip("'")
                             break
-                        # Stop searching after 50 lines
-                        if f.tell() > 5000:
+                        if i > 50:
                             break
             except:
                 pass
