@@ -126,14 +126,75 @@ esac
 
 echo ""
 echo "=========================================="
-echo "Step 4: Generating Credentials"
+echo "Step 4: Configure Credentials"
 echo "=========================================="
+echo ""
+echo "You will be prompted for two sets of credentials:"
+echo ""
+echo "  1. API/Web Editor account — used by admin tools and the web"
+echo "     config editor to manage MediaMTX. Keep this private."
+echo ""
+echo "  2. HLS Viewer account — used by clients that pull HLS streams."
+echo "     Share this with authorized viewers only."
+echo ""
+echo "These credentials will be saved to /opt/mediamtx/mediamtx-credentials.txt"
+echo "(readable by root only). Record them somewhere safe."
+echo ""
 
-WEBEDITOR_USER="webeditor"
-WEBEDITOR_PASS=$(openssl rand -base64 16 | tr -d '/+=\n' | head -c 20)
-HLS_PASS=$(openssl rand -base64 16 | tr -d '/+=\n' | head -c 16)
+# --- API / Web Editor credentials ---
+while true; do
+    read -p "API/Web Editor username [webeditor]: " WEBEDITOR_USER
+    WEBEDITOR_USER="${WEBEDITOR_USER:-webeditor}"
+    if [[ "$WEBEDITOR_USER" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        break
+    fi
+    echo "  Username must be letters, numbers, underscores or hyphens only."
+done
 
-echo "✓ Credentials generated (saved to /opt/mediamtx/webeditor.env)"
+while true; do
+    read -s -p "API/Web Editor password: " WEBEDITOR_PASS
+    echo ""
+    if [ -z "$WEBEDITOR_PASS" ]; then
+        echo "  Password cannot be empty."
+        continue
+    fi
+    read -s -p "Confirm API/Web Editor password: " WEBEDITOR_PASS2
+    echo ""
+    if [ "$WEBEDITOR_PASS" = "$WEBEDITOR_PASS2" ]; then
+        break
+    fi
+    echo "  Passwords do not match. Try again."
+done
+
+echo ""
+
+# --- HLS Viewer credentials ---
+while true; do
+    read -p "HLS Viewer username [hlsviewer]: " HLS_USER
+    HLS_USER="${HLS_USER:-hlsviewer}"
+    if [[ "$HLS_USER" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        break
+    fi
+    echo "  Username must be letters, numbers, underscores or hyphens only."
+done
+
+while true; do
+    read -s -p "HLS Viewer password: " HLS_PASS
+    echo ""
+    if [ -z "$HLS_PASS" ]; then
+        echo "  Password cannot be empty."
+        continue
+    fi
+    read -s -p "Confirm HLS Viewer password: " HLS_PASS2
+    echo ""
+    if [ "$HLS_PASS" = "$HLS_PASS2" ]; then
+        break
+    fi
+    echo "  Passwords do not match. Try again."
+done
+
+echo ""
+echo "✓ Credentials set."
 
 echo ""
 echo "=========================================="
@@ -173,7 +234,7 @@ authInternalUsers:
   - action: read
   - action: publish
   - action: api
-- user: hlsviewer
+- user: ${HLS_USER}
   pass: ${HLS_PASS}
   ips: []
   permissions:
@@ -304,16 +365,38 @@ echo "=========================================="
 echo "Step 8: Saving Credentials"
 echo "=========================================="
 
+cat > /opt/mediamtx/mediamtx-credentials.txt << CREDEOF
+# MediaMTX Credentials
+# Generated: $(date)
+# Keep this file secure — readable by root only.
+#
+# API / Web Editor account (admin tooling, web config editor)
+WEBEDITOR_USER=${WEBEDITOR_USER}
+WEBEDITOR_PASS=${WEBEDITOR_PASS}
+#
+# HLS Viewer account (stream consumers)
+HLS_USER=${HLS_USER}
+HLS_PASS=${HLS_PASS}
+#
+# Port configuration
+API_HOST_PORT=${API_HOST_PORT}
+HLS_PORT=${HLS_PORT}
+SRT_PORT=${SRT_PORT}
+CREDEOF
+chmod 600 /opt/mediamtx/mediamtx-credentials.txt
+echo "✓ Credentials saved to /opt/mediamtx/mediamtx-credentials.txt (root-only)"
+
+# Keep webeditor.env for backwards compatibility with the web editor service
 cat > /opt/mediamtx/webeditor.env << ENVEOF
 WEBEDITOR_USER=${WEBEDITOR_USER}
 WEBEDITOR_PASS=${WEBEDITOR_PASS}
+HLS_USER=${HLS_USER}
 HLS_PASS=${HLS_PASS}
 API_HOST_PORT=${API_HOST_PORT}
 HLS_PORT=${HLS_PORT}
 SRT_PORT=${SRT_PORT}
 ENVEOF
 chmod 600 /opt/mediamtx/webeditor.env
-echo "✓ Saved to /opt/mediamtx/webeditor.env"
 
 echo ""
 echo "=========================================="
@@ -418,7 +501,24 @@ echo "  MediaMTX container: running"
 echo "  Web editor:         http://localhost:5100"
 echo "  Config:             /opt/mediamtx/config/mediamtx.yml"
 echo "  Recordings:         /opt/mediamtx/recordings/"
-echo "  Credentials:        /opt/mediamtx/webeditor.env"
+echo ""
+echo "=========================================="
+echo "YOUR CREDENTIALS (save these now)"
+echo "=========================================="
+echo ""
+echo "  API/Web Editor"
+echo "    Username: ${WEBEDITOR_USER}"
+echo "    Password: ${WEBEDITOR_PASS}"
+echo ""
+echo "  HLS Viewer"
+echo "    Username: ${HLS_USER}"
+echo "    Password: ${HLS_PASS}"
+echo ""
+echo "  These are also saved to:"
+echo "    /opt/mediamtx/mediamtx-credentials.txt  (root-only)"
+echo ""
+echo "  ⚠️  This is the only time passwords are displayed on screen."
+echo "     Copy them to a password manager before closing this terminal."
 echo ""
 echo "  Streaming ports:"
 echo "    RTSP:  ${RTSP_PORT}/tcp"
