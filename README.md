@@ -1,4 +1,4 @@
-MediaMTX Streaming Server Installer
+# MediaMTX Streaming Server Installer
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![MediaMTX](https://img.shields.io/badge/MediaMTX-Auto--Download-blue)](https://github.com/bluenviron/mediamtx)
@@ -16,6 +16,7 @@ MediaMTX Streaming Server Installer
 > - 🧪 Docker-based MediaMTX deployment (alpha — under active development)
 > - 🧪 CloudTAK coexistence mode — automatic port conflict detection and remapping
 > - ✅ API port locked to loopback by default (`127.0.0.1`) — never exposed publicly
+> - ✅ Custom username/password prompts at install time — no hardcoded or auto-generated credentials
 > - ✅ All fixes from upstream v2.0.0–v2.0.4 included
 
 ---
@@ -33,7 +34,11 @@ chmod +x ubuntu-22.04/*.sh
 sudo ./ubuntu-22.04/Ubuntu_22.04_Install_MediaMTX_Docker.sh
 ```
 
-The installer will automatically detect if CloudTAK is running and offer to remap ports to avoid conflicts.
+The installer will prompt you for:
+- API/Web Editor username and password
+- HLS Viewer username and password
+
+It will also automatically detect if CloudTAK is running and offer to remap ports to avoid conflicts.
 
 ### Bare-metal deployment (original)
 
@@ -75,7 +80,9 @@ The Docker installer detects CloudTAK automatically and offers **coexistence mod
 |------|-----------|-------------|
 | HLS | `8888` | `8980` |
 | SRT | `8890` | `8981` |
-| API | `127.0.0.1:9907` | `127.0.0.1:9907` |
+| API | `127.0.0.1:9898` | `127.0.0.1:9898` |
+
+> **Note:** The API is always mapped to host port `9898` (remapped from container-internal `9997`). This is compatible with infra-TAK's MediaMTX web editor, which expects the API on port `9898`.
 
 ### Security: API Port is Always Loopback-Only
 
@@ -108,7 +115,7 @@ cd ~/CloudTAK && docker compose up -d --no-deps media
 | Docker Compose | `/opt/mediamtx/docker-compose.yml` |
 | MediaMTX config | `/opt/mediamtx/config/mediamtx.yml` |
 | Recordings | `/opt/mediamtx/recordings/` |
-| Credentials | `/opt/mediamtx/webeditor.env` |
+| Credentials | `/opt/mediamtx/webeditor.env` , `/opt/mediamtx/mediamtx-credentials.txt` |
 
 ### Container Commands
 
@@ -129,17 +136,71 @@ docker compose -f /opt/mediamtx/docker-compose.yml up -d
 
 ---
 
-## 🔧 infra-TAK Users — Read This First
+## 🔧 infra-TAK Integration
 
-If MediaMTX was deployed through [infra-TAK](https://github.com/takwerx/infra-TAK), the web editor runs with an LDAP overlay for Authentik integration.
+If you are running [infra-TAK](https://github.com/takwerx/infra-TAK) on the same host, this fork is designed to work alongside it.
 
-**Web editor not loading after an update?** The LDAP overlay can become stale after the editor auto-updates. To fix:
+### How it works
+
+infra-TAK's MediaMTX marketplace integration expects:
+- The MediaMTX API on `127.0.0.1:9898`
+- The web editor at `/opt/mediamtx-webeditor/`
+- A systemd service named `mediamtx`
+
+This fork maps the Docker container API to `127.0.0.1:9898` by default, satisfying the first requirement. The web editor and systemd service are handled by infra-TAK's own deploy flow when you configure MediaMTX as a **remote SSH target** pointing at `127.0.0.1`.
+
+### Connecting infra-TAK to your Docker instance
+
+1. In infra-TAK, go to **Marketplace → MediaMTX**
+2. Set deployment target to **On a remote host (SSH)**
+3. Set host to `127.0.0.1`, port `22`, user `takadmin`
+4. Click **Generate SSH key**, **Install SSH key**, **Test SSH**, then **Save target settings**
+5. Click **Deploy MediaMTX** — infra-TAK will install the web editor and wire it to your Docker container
+6. Create a dummy systemd wrapper so infra-TAK's health probe returns `active`:
+
+```bash
+sudo tee /etc/systemd/system/mediamtx.service > /dev/null << 'EOF'
+[Unit]
+Description=MediaMTX (Docker wrapper)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/true
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable mediamtx
+sudo systemctl start mediamtx
+```
+
+7. Set `deployed: true` in infra-TAK's settings:
+
+```bash
+sudo python3 -c "
+import json
+p='/opt/infra-tak/.config/settings.json'
+s=json.load(open(p))
+s['mediamtx_deployment']['deployed']=True
+json.dump(s,open(p,'w'),indent=2)
+print('done')
+"
+```
+
+The infra-TAK marketplace will now show MediaMTX as **Installed / Running**.
+
+### Web editor not loading after an update?
+
+The LDAP overlay can become stale after the editor auto-updates. To fix:
 
 1. Open your **infra-TAK console**
 2. Go to the **MediaMTX** page
 3. Click **Patch web editor**
 
-This re-syncs the LDAP overlay and restarts the editor. **v2.0.1** fixes this at startup automatically.
+This re-syncs the LDAP overlay and restarts the editor.
 
 ---
 
@@ -147,11 +208,12 @@ This re-syncs the LDAP overlay and restarts the editor. **v2.0.1** fixes this at
 
 ### 🐳 Docker Install Script (this fork)
 - ✅ Deploys MediaMTX as a Docker container
+- ✅ Prompts for custom usernames and passwords at install time — no hardcoded credentials
 - ✅ Auto-detects CloudTAK and offers port remapping
-- ✅ API port always bound to loopback only
+- ✅ API port always bound to loopback only (`127.0.0.1:9898`)
 - ✅ Config and recordings bind-mounted from `/opt/mediamtx/`
-- ✅ Auto-generates secure credentials
 - ✅ Installs web editor as systemd service pointed at Docker container
+- ✅ Compatible with infra-TAK MediaMTX marketplace integration
 - ✅ UFW firewall configuration
 
 ### 🔧 MediaMTX Installation Script (bare-metal)
@@ -240,11 +302,12 @@ RTSP sources that wrap H264/AAC inside MPEG-TS (TAKICU, ATAK UAS Tool, ISR camer
 
 ### API Port — Always Loopback Only
 
-The MediaMTX control API is mapped to `127.0.0.1` on the host in all Docker deployments. It is never reachable from the internet. Only Caddy should bind on `0.0.0.0`.
+The MediaMTX control API is mapped to `127.0.0.1:9898` on the host in all Docker deployments. It is never reachable from the internet. Only Caddy should bind on `0.0.0.0`.
 
-### Default Credentials (Docker install)
-- Credentials are auto-generated and saved to `/opt/mediamtx/webeditor.env`
-- No default passwords — every install gets unique credentials
+### Credentials (Docker install)
+- The installer prompts for custom usernames and passwords at install time
+- No hardcoded or auto-generated credentials — you choose them
+- Credentials are saved to `/opt/mediamtx/webeditor.env` and `/opt/mediamtx/mediamtx-credentials.txt`
 
 ### Firewall Ports (Docker install)
 | Port | Protocol | Purpose |
@@ -257,7 +320,7 @@ The MediaMTX control API is mapped to `127.0.0.1` on the host in all Docker depl
 | 80 | tcp | HTTP (Caddy/ACME only) |
 | 443 | tcp | HTTPS (Caddy only) |
 
-The API port (`9907`) is loopback-only — **no firewall rule needed or added.**
+The API port (`9898`) is loopback-only — **no firewall rule needed or added.**
 
 ---
 
@@ -287,13 +350,12 @@ MIT License - See [LICENSE](LICENSE) file for details.
 
 - **MediaMTX** by [bluenviron](https://github.com/bluenviron/mediamtx)
 - **Original scripts** by [The TAK Syndicate](https://www.thetaksyndicate.org)
-- **Docker support** by [dfndr13](https://github.com/dfndr13)
+- **Docker support & infra-TAK integration** by [dfndr13](https://github.com/dfndr13)
 
 ---
 
-**Fork maintained by:** dfndr13  
-**Upstream:** takwerx/mediamtx-installer  
-**Web Editor:** v2.0.4  
-**Compatible with:** MediaMTX v1.17.0+  
+**Fork maintained by:** dfndr13
+**Upstream:** takwerx/mediamtx-installer
+**Web Editor:** v2.0.4
+**Compatible with:** MediaMTX v1.17.0+
 **Tested on:** Ubuntu 22.04 LTS
-
