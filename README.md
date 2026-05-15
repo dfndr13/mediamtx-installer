@@ -204,6 +204,49 @@ This re-syncs the LDAP overlay and restarts the editor.
 
 ---
 
+## 🔒 Authentik LDAP Overlay
+
+The LDAP overlay patches the MediaMTX web editor to integrate with [Authentik](https://goauthentik.io) for role-based stream access control. It is automatically applied by infra-TAK when Authentik is detected.
+
+### What it adds
+
+- **Auto-authentication** via Authentik forward auth headers - no separate login page
+- **Role-based access** - four roles mapped from Authentik group membership
+- **Agency-scoped stream filtering** - users only see streams belonging to their agency
+- **Agency admin page** - agency admins can manage their own streams without full editor access
+
+### Role Matrix
+
+| Role | Authentik Group | Can See | Can Do |
+|------|----------------|---------|--------|
+| vid_admin | vid_admin or authentik Admins | All agencies, all streams | Full config editor + stream management |
+| vid_agency_admin | vid_agency_admin | Own agency only | Watch, share, set visibility, stop streams |
+| vid_private | vid_private | Own agency public + private streams | Watch + share |
+| vid_public | vid_public | Own agency public streams only | Watch + share |
+
+### Agency Scoping
+
+Agency filtering is driven by a single agency_abbreviation attribute on each Authentik user. Stream paths follow the convention AGENCY/streamname (e.g. MPD/phone - example only).
+
+You only ever create **one** vid_agency_admin group regardless of how many agencies you have. Any user in that group becomes an agency admin for whatever agency is set in their agency_abbreviation attribute. No per-agency groups needed.
+
+### Setup
+
+1. Create groups in Authentik: vid_admin, vid_agency_admin, vid_private, vid_public
+2. Set agency_abbreviation and agency_name attributes on each user (e.g. MPD / Mayberry Police Department - example only)
+3. Assign users to the appropriate group
+4. Stream paths must follow AGENCY_ABBREVIATION/streamname convention
+
+### Pages
+
+| Role | URL |
+|------|-----|
+| vid_admin | / (full editor) |
+| vid_agency_admin | /agency-admin |
+| vid_private / vid_public | /viewer |
+
+---
+
 ## ✨ Features
 
 ### 🐳 Docker Install Script (this fork)
