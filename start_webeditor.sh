@@ -34,7 +34,7 @@ sed -i "s|MEDIAMTX_BINARY = '/usr/local/bin/mediamtx'|MEDIAMTX_BINARY = '/usr/lo
 echo "[wrapper] Reapplying mediamtx-webeditor-patches..."
 /home/takadmin/CloudTAK/mediamtx-webeditor-patches/apply-patches.sh
 
-# 6. Ensure apply_ldap_overlay is called
+# 8. Ensure apply_ldap_overlay is called
 if ! grep -q "apply_ldap_overlay" "$APP"; then
     echo "[wrapper] Re-adding apply_ldap_overlay call..."
     sed -i "s|if __name__ == '__main__':|from mediamtx_ldap_overlay import apply_ldap_overlay\napply_ldap_overlay(app)\n\nif __name__ == '__main__':|" "$APP"
