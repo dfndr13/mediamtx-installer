@@ -240,7 +240,7 @@ The LDAP overlay (`mediamtx_ldap_overlay.py`) patches the MediaMTX web editor to
 - **Auto-authentication** via Authentik forward auth headers - no separate login page
 - **Role-based access** - four Authentik groups mapped to three roles: admin, agency admin and viewer
 - **Agency-scoped stream filtering** - users see the streams of the agency in their `agency_abbreviation` attribute
-- **Agency admin page** (`/agency-admin`) - lists the agency's streams and sets each one public or private
+- **Agency admin page** (`/agency-admin`) - lists the agency's streams, with Watch, Share, Stop and a public/private toggle for each
 - **Stream Access page** (`/stream-access`) - vid_admin manages users' viewer groups in Authentik
 
 ### The four groups
@@ -248,7 +248,7 @@ The LDAP overlay (`mediamtx_ldap_overlay.py`) patches the MediaMTX web editor to
 | Group | Role | Lands on | Sees | Can do today |
 |-------|------|----------|------|--------------|
 | `vid_admin` (or `authentik Admins`) | admin | `/` (full editor) | Every agency's streams | Full config editor, Stream Access page, watch any stream, set visibility on any stream (API only, see below) |
-| `vid_agency_admin` | agency admin | `/agency-admin` | Own agency's streams, public and private | Set public/private visibility on own agency's streams. For Watch, Share and Stop, see [Known issues](#known-issues) |
+| `vid_agency_admin` | agency admin | `/agency-admin` | Own agency's streams, public and private | Watch, share, stop and set public/private visibility on own agency's streams |
 | `vid_private` | viewer | `/viewer` | Own agency's public and private streams | Watch, share |
 | `vid_public` | viewer | `/viewer` | Own agency's public streams only | Watch, share |
 
@@ -260,7 +260,7 @@ If a user is in more than one group, the highest role wins: admin, then agency a
 
 One server hosts video for several independent public safety agencies, such as police, sheriff, highway patrol, fire/EMS and a university. Each agency owns its own video. A UAS, body-worn or fixed camera feed can show an active incident, a suspect, a victim or tactical positions, and another agency shouldn't see it just because both agencies share the platform.
 
-So by default, users see only their own agency's streams. Sharing across agencies is a deliberate act, done with a share link. The platform never does it on its own. (Agency admins can't create share links yet; see [Known issues](#known-issues).)
+So by default, users see only their own agency's streams. Sharing across agencies is a deliberate act, done with a share link. The platform never does it on its own.
 
 - **Gating follows the stream path.** The first part of the path says which agency owns the stream (`MPD` in `MPD/patrol_1`, Mayberry Police Department, example only). A new stream is filtered correctly the moment it's published, with no per-stream setup.
 - **The agency comes from the user's `agency_abbreviation` attribute.** TAK Portal sets it when a user is onboarded, so agency membership is managed in one place and the video system never keeps its own list.
@@ -268,7 +268,7 @@ So by default, users see only their own agency's streams. Sharing across agencie
 #### Role Definitions
 
 - **`vid_admin`: the platform operator.** Runs the server, manages every agency's streams and users, and troubleshoots. It's kept separate from agency admins so that day-to-day agency work never needs server-wide rights.
-- **`vid_agency_admin`: the person who runs an agency's streams**, for example a UAS pilot or unit lead. They manage their own agency's streams from `/agency-admin`, without access to the config editor or to other agencies. Today that means setting visibility; Stop doesn't work yet (see [Known issues](#known-issues)). There is one shared group for every agency, because the agency comes from the user's attribute, not the group. People who run streams only need this group, not a viewer group too. They still can't watch their own private streams, though; see [Known issues](#known-issues).
+- **`vid_agency_admin`: the person who runs an agency's streams**, for example a UAS pilot or unit lead. They watch, share, stop and set visibility on their own agency's streams from `/agency-admin`, without access to the config editor or to other agencies. Stop disconnects the stream's publisher. A stream that MediaMTX pulls itself (a configured source) can't be stopped this way, and the page shows an error instead. There is one shared group for every agency, because the agency comes from the user's attribute, not the group. People who run streams only need this group, not a viewer group too.
 - **`vid_private`: trusted agency members** who need everything their agency streams, including sensitive feeds.
 - **`vid_public`: broader agency members** who should see routine feeds but not ones marked sensitive.
 
@@ -295,7 +295,7 @@ An agency admin marks each of their own streams public or private, so the decisi
 2. Authentik answers with `X-Authentik-Username` and `X-Authentik-Groups`, with group names separated by `|`. Caddy copies both onto the request it proxies to the web editor on `127.0.0.1:5100`.
 3. On every request the overlay splits the groups on `|`, maps them to a role and stores the role in the session. On a user's first request, it also looks the user up in the Authentik API and caches `agency_name` and `agency_abbreviation` in the session. A change to those attributes takes effect when the user starts a new web editor session.
 4. Viewers and agency admins can reach only their own pages and APIs. Anything else redirects to `/viewer` or `/agency-admin`. Admins aren't restricted.
-5. Stream lists and playback are filtered by agency. The first part of the stream path (`MPD` in `MPD/patrol_1`) is compared with the user's `agency_abbreviation`, ignoring case. Private streams are then hidden from users without `vid_private`.
+5. Stream lists and playback are filtered by agency. The first part of the stream path (`MPD` in `MPD/patrol_1`) is compared with the user's `agency_abbreviation`, ignoring case. Private streams are then hidden from viewers without `vid_private`. Agency admins see their own agency's private streams.
 
 ### Setup
 
@@ -366,9 +366,6 @@ Generate one with `openssl rand -hex 32`. If the two don't match, or the variabl
 
 ### Known issues
 
-- **Agency admins can't watch their own agency's private streams.** `/watch` and `/hls-proxy` allow private streams only for vid_admin, or for viewers with `vid_private`, so an agency admin gets a 403. Adding `vid_private` doesn't help, because the agency admin role takes precedence. Until this is fixed, a user with only `vid_agency_admin`, such as a UAS pilot, can't watch their own streams once those are set to private.
-- **Agency admins can't create share links.** The Share button calls `/api/share-links/generate`, which only accepts the admin and viewer roles, so it returns 403.
-- **Stop doesn't stop anything.** The Stop button calls `POST /v3/paths/kick/<path>` on the MediaMTX API. MediaMTX has no such endpoint, so the API answers 404, and the overlay counts a 404 as success. The page reports success while the publisher stays connected.
 - **vid_admin has no visibility control in the UI.** Use the API or edit `stream_visibility.json`, as described above.
 - **Agency abbreviations aren't guaranteed to be unique.** `agency_name` is the unique key, but filtering uses `agency_abbreviation`, so two agencies that share an abbreviation see each other's streams.
 
