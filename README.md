@@ -254,9 +254,32 @@ The LDAP overlay (`mediamtx_ldap_overlay.py`) patches the MediaMTX web editor to
 
 If a user is in more than one group, the highest role wins: admin, then agency admin, then viewer. For example, a member of both `vid_agency_admin` and `vid_private` is an agency admin.
 
+### Access Control Model
+
+#### Agency Isolation
+
+One server hosts video for several independent public safety agencies, such as police, sheriff, highway patrol, fire/EMS and a university. Each agency owns its own video. A UAS, body-worn or fixed camera feed can show an active incident, a suspect, a victim or tactical positions, and another agency shouldn't see it just because both agencies share the platform.
+
+So by default, users see only their own agency's streams. Sharing across agencies is a deliberate act, done with a share link. The platform never does it on its own. (Agency admins can't create share links yet; see [Known issues](#known-issues).)
+
+- **Gating follows the stream path.** The first part of the path says which agency owns the stream (`MPD` in `MPD/patrol_1`, Mayberry Police Department, example only). A new stream is filtered correctly the moment it's published, with no per-stream setup.
+- **The agency comes from the user's `agency_abbreviation` attribute.** TAK Portal sets it when a user is onboarded, so agency membership is managed in one place and the video system never keeps its own list.
+
+#### Role Definitions
+
+- **`vid_admin`: the platform operator.** Runs the server, manages every agency's streams and users, and troubleshoots. It's kept separate from agency admins so that day-to-day agency work never needs server-wide rights.
+- **`vid_agency_admin`: the person who runs an agency's streams**, for example a UAS pilot or unit lead. They manage their own agency's streams from `/agency-admin`, without access to the config editor or to other agencies. Today that means setting visibility; Stop doesn't work yet (see [Known issues](#known-issues)). There is one shared group for every agency, because the agency comes from the user's attribute, not the group. People who run streams only need this group, not a viewer group too. They still can't watch their own private streams, though; see [Known issues](#known-issues).
+- **`vid_private`: trusted agency members** who need everything their agency streams, including sensitive feeds.
+- **`vid_public`: broader agency members** who should see routine feeds but not ones marked sensitive.
+
+#### Public and Private Streams
+
+Not every feed in an agency is equally sensitive. A traffic or overview camera can go to the whole agency, while a tactical or investigative feed should go to a smaller group.
+
+An agency admin marks each of their own streams public or private, so the decision sits with the agency that owns the video, not with the platform operator.
+
 ### Why it's designed this way
 
-- **One agency admin group for every agency.** There is a single shared `vid_agency_admin` group. The user's agency comes from their `agency_abbreviation` attribute, not from the group name. Per-agency groups don't scale and add another place to manage, and TAK Portal already writes `agency_name` and `agency_abbreviation` to every Authentik user.
 - **The old suffix approach is gone.** Earlier versions detected agency admins by TAK Portal groups ending in `-AgencyAdmin`. The overlay now checks only `vid_agency_admin`.
 - **Visibility belongs to the stream, not the group.** Each stream is public or private, stored in `stream_visibility.json` in the web editor directory. Streams that aren't listed are public. Agency admins set visibility for their own agency's streams on `/agency-admin`. vid_admin can set it for any stream, but no page has a control for that yet. From a logged-in admin session, `POST /api/stream-visibility` with `{"stream": "MPD/patrol_1", "level": "private"}`, or edit the file directly (it's read on every request):
   ```json
