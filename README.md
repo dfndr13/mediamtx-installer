@@ -330,12 +330,14 @@ video.<your-domain> {
 
 Since MediaMTX v1.18.0, HLS logins use cookie sessions. Instead of handling those cookies, the web editor's `/hls-proxy` sends `Authorization: Bearer <hlsCDNSecret>` to MediaMTX HLS on `127.0.0.1:8980`. `hlsCDNSecret` arrived in MediaMTX v1.18.1, which is why that's the minimum version.
 
-The secret is set in two places, and they must match:
+The secret is set in both of these places, and they must match:
 
 | Where | Setting |
 |-------|---------|
 | `/opt/mediamtx/config/mediamtx.yml` | `hlsCDNSecret: <hls-secret>` |
 | web editor systemd unit | `Environment=MEDIAMTX_HLS_SECRET=<hls-secret>` |
+
+The same secret must also be set in the reverse proxy config that forwards HLS to MediaMTX.
 
 Generate one with `openssl rand -hex 32`. If the two don't match, or the variable is missing, playback through `/watch` fails. Share links keep working, because they use the `hlsviewer` account instead.
 
