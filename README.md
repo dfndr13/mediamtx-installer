@@ -611,7 +611,7 @@ mediamtx-installer/
 │   └── Ubuntu_22.04_Install_MediaMTX_Caddy.sh    # SSL/Let's Encrypt setup
 ├── config-editor/
 │   ├── Install_MediaMTX_Config_Editor.sh          # Web editor installer
-│   └── mediamtx_config_editor.py                  # Web editor application (v2.1.4)
+│   └── mediamtx_config_editor.py                  # Web editor application (v2.1.12, deployed/patched copy)
 ├── scripts/
 │   └── ku-band-simulator/                         # Ku-band link simulator
 ├── mediamtx_ldap_overlay.py                       # Authentik overlay (vid_* roles, agency filtering)
@@ -697,6 +697,6 @@ MIT License - See [LICENSE](LICENSE) file for details.
 
 **Fork maintained by:** dfndr13
 **Upstream:** takwerx/mediamtx-installer
-**Web Editor:** overlay tested with v2.1.12 (the copy in `config-editor/` is still v2.1.4)
+**Web Editor:** v2.1.12 (`config-editor/` holds the deployed, patched copy)
 **Compatible with:** MediaMTX v1.18.1+ (needs `hlsCDNSecret`; tested with v1.21.2)
 **Tested on:** Ubuntu 22.04 LTS

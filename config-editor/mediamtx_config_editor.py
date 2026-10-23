@@ -34,7 +34,7 @@ def add_no_cache_headers(response):
     return response
 
 # Version - used by auto-update checker
-CURRENT_VERSION = "v2.1.4"
+CURRENT_VERSION = "v2.1.12"
 GITHUB_REPO = "takwerx/mediamtx-installer"
 GITHUB_RAW_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/config-editor/mediamtx_config_editor.py"
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -196,6 +196,29 @@ def clear_srt_passphrase_backup():
     if os.path.exists(SRT_PASSPHRASE_BACKUP_FILE):
         os.remove(SRT_PASSPHRASE_BACKUP_FILE)
 
+def _yaml_scalar_text(raw):
+    """The string a YAML scalar holds, as written on one line of the file.
+
+    save_config() writes every password as `pass: "..."`, and returning the raw
+    text kept those quotes as part of the password. The console then sent
+    `"secret"` to MediaMTX, which refused it: Watch spun forever and share links
+    failed, but only for viewers outside the box -- loopback is authorised by
+    the `any` user, so the same request from the server itself worked.
+    Unquoted values are returned as-is (a YAML parse would turn 0123 into 123).
+    """
+    raw = raw.strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in '"\'':
+        try:
+            from io import StringIO
+            value = YAML(typ='safe').load(StringIO(raw))
+            if isinstance(value, str):
+                return value
+        except Exception:
+            pass
+        return raw[1:-1]
+    return raw
+
+
 def get_hlsviewer_credential():
     """Get hlsviewer credential by reading directly from config file"""
     try:
@@ -210,7 +233,7 @@ def get_hlsviewer_credential():
                     if 'pass:' in lines[j]:
                         pass_line = lines[j].strip()
                         if ':' in pass_line:
-                            password = pass_line.split(':', 1)[1].strip()
+                            password = _yaml_scalar_text(pass_line.split(':', 1)[1].strip())
                             if password:
                                 # Ensure it's in group metadata
                                 ensure_hlsviewer_in_metadata()
@@ -417,7 +440,7 @@ def webrtc_available():
     8189/udp reaches the viewer, since that leg never touches the console.
     """
     try:
-        return read_yaml_field('webrtc', 'no') == 'yes'
+        return read_yaml_flag('webrtc')
     except Exception:
         return False
 
@@ -1938,7 +1961,7 @@ HTML_TEMPLATE = '''
                             <p class="help-text" style="margin: 8px 0 0 0;">Sub-second browser viewing. Video only &mdash; audio and KLV are not carried over WebRTC, so ATAK and CoT keep using RTSP/SRT.</p>
                         </div>
                     </div>
-                    <p class="help-text" style="margin-top: 15px;">Opens 8889/tcp (signalling) and 8189/udp (media). On a cloud box behind NAT, also set <strong>webrtcAdditionalHosts</strong> to the public IP in Advanced YAML, or viewers will be handed the private address and fail to connect.</p>
+                    <p class="help-text" style="margin-top: 15px;">Opens 8189/udp (media) only. WHEP signalling is proxied through the console &mdash; MediaMTX's WebRTC HTTP listener (:8887) is published on 127.0.0.1 and never exposed. On a cloud box behind NAT, also set <strong>webrtcAdditionalHosts</strong> to the public IP in Advanced YAML, or viewers will be handed the private address and fail to connect.</p>
                 </div>
                 
                 <form method="POST" action="/save_protocols">
@@ -2175,7 +2198,7 @@ HTML_TEMPLATE = '''
                     <div class="form-row">
                         <div class="form-group">
                             <label>WebRTC Port</label>
-                            <input type="number" name="webrtcAddress" value="{{ config.get('webrtcAddress', ':8889').split(':')[1] if ':' in config.get('webrtcAddress', ':8889') else '8889' }}" placeholder="8889">
+                            <input type="number" name="webrtcAddress" value="{{ config.get('webrtcAddress', ':8887').split(':')[1] if ':' in config.get('webrtcAddress', ':8887') else '8887' }}" placeholder="8887">
                             <p class="help-text">HTTP port for signalling (WHEP). Media flows over UDP 8189.</p>
                         </div>
 
@@ -2326,7 +2349,8 @@ HTML_TEMPLATE = '''
                 <div class="alert alert-info" style="margin-top: 20px;">
                     <strong>💡 How it works:</strong><br>
                     Add external stream sources here. MediaMTX will connect to them and rebroadcast through your server, just like local drone streams.<br><br>
-                    <strong>Supported protocols:</strong> SRT, RTSP, UDP MPEG-TS, RTMP, HLS<br><br>
+                    <strong>Supported protocols:</strong> SRT, RTSP, UDP MPEG-TS (unicast or local multicast), RTMP, HLS<br>
+                    Paths you added by hand to mediamtx.yml with a pulled <code>source:</code> URL show up here too, and can be edited or removed.<br><br>
                     <strong>Two ways agencies share:</strong><br>
                     1. <strong>They push to us</strong> — Create a user for them in Users & Auth. No external source needed.<br>
                     2. <strong>We pull from them</strong> — Add their URL here. This tab handles that.
@@ -2378,7 +2402,7 @@ HTML_TEMPLATE = '''
                             <select id="source-protocol" onchange="updateSourceFormFields()">
                                 <option value="srt">SRT (recommended for agency-to-agency)</option>
                                 <option value="rtsp">RTSP (IP cameras, RTSP servers)</option>
-                                <option value="udp">UDP MPEG-TS (multicast, encoders)</option>
+                                <option value="udp">UDP MPEG-TS (local multicast, encoders)</option>
                                 <option value="rtmp">RTMP (RTMP servers)</option>
                                 <option value="hls">HLS (HTTP streams)</option>
                             </select>
@@ -2515,15 +2539,29 @@ HTML_TEMPLATE = '''
                             </div>
                         </div>
                         <div id="udp-source-fields" style="display: none;">
-                            <div class="form-group">
-                                <label>Listen Port</label>
-                                <input type="number" id="source-udp-port" placeholder="5004" value="5004">
-                                <p class="help-text">UDP port your server will listen on. Give the sender your server IP and this port. A firewall rule will be created automatically.</p>
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label>Multicast Group / Listen Address (optional)</label>
+                                    <input type="text" id="source-udp-address" placeholder="e.g., 239.0.0.1 (blank = unicast to this server)">
+                                    <p class="help-text">For a producer that publishes to local multicast, enter its group address (224.0.0.0&ndash;239.255.255.255). Leave blank to receive unicast sent to this server's IP.</p>
+                                </div>
+                                <div class="form-group">
+                                    <label>Port</label>
+                                    <input type="number" id="source-udp-port" placeholder="5004" value="5004" min="1" max="65535">
+                                    <p class="help-text">UDP port the producer sends to. A firewall rule will be created automatically.</p>
+                                </div>
                             </div>
-                            <div class="form-group">
-                                <label>Source IP Filter (optional)</label>
-                                <input type="text" id="source-udp-filter" placeholder="e.g., 192.168.1.100">
-                                <p class="help-text">Only accept packets from this IP address. Recommended for security. Leave empty to accept from any source.</p>
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label>Network Interface (optional, multicast)</label>
+                                    <input type="text" id="source-udp-interface" placeholder="e.g., eth0 (blank = automatic)">
+                                    <p class="help-text">Interface to join the multicast group on. Leave blank to let MediaMTX pick it from the routing table.</p>
+                                </div>
+                                <div class="form-group">
+                                    <label>Source IP Filter (optional)</label>
+                                    <input type="text" id="source-udp-filter" placeholder="e.g., 192.168.1.100">
+                                    <p class="help-text">Only accept packets from this IP address. Recommended for security. Leave empty to accept from any source.</p>
+                                </div>
                             </div>
                         </div>
                         <div id="rtmp-source-fields" style="display: none;">
@@ -2558,6 +2596,14 @@ HTML_TEMPLATE = '''
                                 <input type="text" id="source-hls-url" placeholder="e.g., https://their.server.com/stream/index.m3u8">
                                 <p class="help-text">Full URL to the .m3u8 playlist. Supports http:// and https://</p>
                             </div>
+                        </div>
+                        <div class="form-group">
+                            <label>Connection</label>
+                            <select id="source-on-demand">
+                                <option value="no">Always on &mdash; pull the stream continuously (sourceOnDemand: no)</option>
+                                <option value="yes">On demand &mdash; only pull while someone is watching (sourceOnDemand: yes)</option>
+                            </select>
+                            <p class="help-text">Always on keeps the stream live in Active Streams. On demand saves bandwidth but the first viewer waits a few seconds for the source to start.</p>
                         </div>
 
                         <!-- KLV -> CoT (per-source) -->
@@ -4660,7 +4706,9 @@ HTML_TEMPLATE = '''
             if (form) {
                 if (form.dataset.editing) delete form.dataset.editing;
                 if (form.dataset.editingIps) delete form.dataset.editingIps;
-                
+                delete form.dataset.editingPass;
+                delete form.dataset.editingPerms;
+
                 // Reset button text back to "Create User"
                 const submitButton = form.querySelector('button[type="submit"]');
                 if (submitButton) {
@@ -4702,7 +4750,7 @@ HTML_TEMPLATE = '''
             }
             
             // Validate MediaMTX allowed characters (no spaces, commas, apostrophes, slashes)
-            const allowedChars = /^[A-Za-z0-9!$()*.+;<=>\[\]^_\-"@#&]+$/;
+            const allowedChars = /^[A-Za-z0-9!$()*.+;<=>\[\]^_\-{}@#&]+$/;
             
             if (!allowedChars.test(username)) {
                 alert('Username contains invalid characters!\\n\\nAllowed: A-Z, 0-9, !$()*.@#& etc.\\nNOT allowed: spaces, commas, apostrophes, slashes');
@@ -4722,6 +4770,8 @@ HTML_TEMPLATE = '''
                     body: JSON.stringify({
                         oldUsername: editingUsername,
                         oldIps: editingIps,
+                        oldPass: form.dataset.editingPass,
+                        oldPermissions: form.dataset.editingPerms ? JSON.parse(form.dataset.editingPerms) : null,
                         groupName,
                         username,
                         password,
@@ -4733,6 +4783,8 @@ HTML_TEMPLATE = '''
                     if (data.success) {
                         delete form.dataset.editing;
                         delete form.dataset.editingIps;
+                        delete form.dataset.editingPass;
+                        delete form.dataset.editingPerms;
                         hideAddMediaMTXUserForm();
                         loadMediaMTXUsers();
                         reloadYAMLContent();
@@ -4845,8 +4897,11 @@ HTML_TEMPLATE = '''
             document.getElementById('source-rtsp-user').value = '';
             document.getElementById('source-rtsp-pass').value = '';
             // UDP fields
+            document.getElementById('source-udp-address').value = '';
             document.getElementById('source-udp-port').value = '5004';
+            document.getElementById('source-udp-interface').value = '';
             document.getElementById('source-udp-filter').value = '';
+            document.getElementById('source-on-demand').value = 'no';
             // RTMP fields
             document.getElementById('source-rtmp-secure').value = 'rtmp';
             document.getElementById('source-rtmp-host').value = '';
@@ -4909,15 +4964,16 @@ HTML_TEMPLATE = '''
             if (!nameEl) return;
             const name = nameEl.value.trim();
             const protocol = document.getElementById('source-protocol').value;
-            const alwaysOn = true;  // Always connected by default
-            
+            const alwaysOn = document.getElementById('source-on-demand').value !== 'yes';
+
             if (!name) {
                 alert('Stream name is required');
                 return;
             }
-            
-            // Validate name: lowercase, numbers, underscores only
-            if (!/^[a-z0-9_]+$/.test(name)) {
+
+            // Validate name: lowercase, numbers, underscores only (existing names, e.g. ones
+            // written by hand in mediamtx.yml, are kept as they are)
+            if (!editingSourceName && !/^[a-z0-9_]+$/.test(name)) {
                 alert('Stream name must be lowercase letters, numbers, and underscores only');
                 return;
             }
@@ -4993,13 +5049,30 @@ HTML_TEMPLATE = '''
                     sourceUrl = scheme + '://' + host + ':' + port + '/' + path;
                 }
             } else if (protocol === 'udp') {
+                // Strip a pasted scheme / :port so "udp://239.0.0.1:9000" in the address box works
+                const address = document.getElementById('source-udp-address').value.trim()
+                    .replace(/^udp(\\+mpegts)?:\\/\\//i, '').replace(/[\\/?].*$/, '').replace(/:\\d+$/, '') || '0.0.0.0';
                 const port = document.getElementById('source-udp-port').value.trim() || '5004';
+                const iface = document.getElementById('source-udp-interface').value.trim();
                 const sourceFilter = document.getElementById('source-udp-filter').value.trim();
-                
-                sourceUrl = 'udp+mpegts://0.0.0.0:' + port;
-                if (sourceFilter) {
-                    sourceUrl += '?source=' + sourceFilter;
+
+                if (!/^\\d+$/.test(port) || parseInt(port) < 1 || parseInt(port) > 65535) {
+                    alert('UDP port must be a number from 1 to 65535');
+                    return;
                 }
+                if (!/^[A-Za-z0-9.-]+$/.test(address)) {
+                    alert('UDP address must be an IPv4 address or hostname, e.g. 239.0.0.1');
+                    return;
+                }
+                if (iface && !/^[A-Za-z0-9_.:-]{1,15}$/.test(iface)) {
+                    alert('Network interface must be an interface name such as eth0');
+                    return;
+                }
+                sourceUrl = 'udp+mpegts://' + address + ':' + port;
+                let udpParams = [];
+                if (sourceFilter) udpParams.push('source=' + sourceFilter);
+                if (iface) udpParams.push('interface=' + iface);
+                if (udpParams.length) sourceUrl += '?' + udpParams.join('&');
             } else if (protocol === 'rtmp') {
                 const scheme = document.getElementById('source-rtmp-secure').value;
                 const host = document.getElementById('source-rtmp-host').value.trim();
@@ -5077,7 +5150,7 @@ HTML_TEMPLATE = '''
                     hideAddSourceForm();
                     loadExternalSources();
                     reloadYAMLContent();
-                    alert(successMsg);
+                    alert(successMsg + (data.warning ? '\\n\\n⚠️ ' + data.warning : ''));
                 } else {
                     alert('Error: ' + (data.error || 'Unknown error'));
                 }
@@ -5153,7 +5226,7 @@ HTML_TEMPLATE = '''
                     data.sources.forEach(source => {
                         const shareMode = shareModeMap[source.name] || 'private';
                         html += '<tr style="border-bottom: 1px solid #4a4a4a;">';
-                        html += '<td style="padding: 12px;"><strong>' + escapeHtml(source.name) + '</strong> <button class="share-mode-badge-ext" data-stream-name="' + escapeHtml(source.name).replace(/"/g, '&quot;') + '" data-mode="' + shareMode + '" style="margin-left:8px;padding:2px 8px;font-size:11px;font-weight:bold;border-radius:4px;border:none;cursor:pointer;background:' + (shareMode === 'public' ? '#16a34a' : '#dc2626') + ';color:#fff;" title="Link sharing: ' + (shareMode === 'public' ? 'Static' : 'Token') + '. Click to toggle (admin).">' + (shareMode === 'public' ? 'Public' : 'Private') + '</button>' + (source.klv && source.klv.to_cot ? ' <span style="padding:2px 8px;font-size:11px;font-weight:bold;border-radius:4px;background:#0e7490;color:#fff;" title="KLV &rarr; CoT to ' + escapeHtml(source.klv.target || '') + ' — BETA: our side is verified, the aggregator-side merge that moves the aircraft marker is still outstanding">📡 KLV&rarr;CoT <span style="opacity:.85;font-size:10px;">BETA</span></span>' : '') + '</td>';
+                        html += '<td style="padding: 12px;"><strong>' + escapeHtml(source.name) + '</strong> <button class="share-mode-badge-ext" data-stream-name="' + escapeHtml(source.name).replace(/"/g, '&quot;') + '" data-mode="' + shareMode + '" style="margin-left:8px;padding:2px 8px;font-size:11px;font-weight:bold;border-radius:4px;border:none;cursor:pointer;background:' + (shareMode === 'public' ? '#16a34a' : '#dc2626') + ';color:#fff;" title="Link sharing: ' + (shareMode === 'public' ? 'Static' : 'Token') + '. Click to toggle (admin).">' + (shareMode === 'public' ? 'Public' : 'Private') + '</button>' + (source.from_yaml ? ' <span style="padding:2px 8px;font-size:11px;border-radius:4px;background:#555;color:#ddd;" title="Written by hand in mediamtx.yml. Edit or Delete here works on that entry.">mediamtx.yml</span>' : '') + (source.klv && source.klv.to_cot ? ' <span style="padding:2px 8px;font-size:11px;font-weight:bold;border-radius:4px;background:#0e7490;color:#fff;" title="KLV &rarr; CoT to ' + escapeHtml(source.klv.target || '') + ' — BETA: our side is verified, the aggregator-side merge that moves the aircraft marker is still outstanding">📡 KLV&rarr;CoT <span style="opacity:.85;font-size:10px;">BETA</span></span>' : '') + '</td>';
                         
                         // Clean URL display: mask passphrase and strip SRT tuning params
                         let displayUrl = source.source_url || '';
@@ -5217,7 +5290,7 @@ HTML_TEMPLATE = '''
                             html += '<button class="btn" data-toggle-btn onclick="toggleExternalSource(\\'' + escapeHtml(source.name) + '\\')" style="padding: 6px 14px; font-size: 13px; background: #4caf50; color: white; border: none; border-radius: 4px; cursor: pointer;">Enable</button>';
                         }
                         var srcUrl = (source.source_url || '');
-                        if (srcUrl && srcUrl.indexOf('udp+mpegts://') !== 0) {
+                        if (srcUrl && srcUrl.indexOf('udp+mpegts://') !== 0 && srcUrl.indexOf('udp://') !== 0) {
                             var esc = srcUrl.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
                             html += '<button class="btn simulator-for-source-btn" data-source-url="' + esc + '" style="padding: 6px 14px; font-size: 13px; background: #6d28d9; color: white; border: none; border-radius: 4px; cursor: pointer;" title="Set simulator to this source and turn ON">Simulate link</button>';
                         }
@@ -5419,6 +5492,8 @@ HTML_TEMPLATE = '''
                         toggleKlvFields(); updateKlvTransport();
                     }
 
+                    document.getElementById('source-on-demand').value = source.on_demand ? 'yes' : 'no';
+
                     let url = source.source_url || '';
                     // Normalize double srt:// so parse and display are correct
                     if (url.startsWith('srt://')) {
@@ -5492,16 +5567,21 @@ HTML_TEMPLATE = '''
                             document.getElementById('source-rtsp-port').value = rtspMatch[4] || '554';
                             document.getElementById('source-rtsp-path').value = rtspMatch[5] || '';
                         }
-                    } else if (url.startsWith('udp+mpegts://')) {
+                    } else if (url.startsWith('udp+mpegts://') || url.startsWith('udp://')) {
                         document.getElementById('source-protocol').value = 'udp';
                         updateSourceFormFields();
-                        const udpMatch = url.match(/udp\\+mpegts:\\/\\/([^:]+):(\\d+)/);
+                        const udpMatch = url.match(/udp(?:\\+mpegts)?:\\/\\/([^:\\/?]+):(\\d+)/);
                         if (udpMatch) {
+                            document.getElementById('source-udp-address').value = udpMatch[1] === '0.0.0.0' ? '' : udpMatch[1];
                             document.getElementById('source-udp-port').value = udpMatch[2];
                         }
-                        const srcMatch = url.match(/source=([^&]+)/);
+                        const srcMatch = url.match(/[?&]source=([^&]+)/);
                         if (srcMatch) {
                             document.getElementById('source-udp-filter').value = srcMatch[1];
+                        }
+                        const ifMatch = url.match(/[?&]interface=([^&]+)/);
+                        if (ifMatch) {
+                            document.getElementById('source-udp-interface').value = ifMatch[1];
                         }
                     } else if (url.startsWith('rtmp://') || url.startsWith('rtmps://')) {
                         document.getElementById('source-protocol').value = 'rtmp';
@@ -5524,7 +5604,7 @@ HTML_TEMPLATE = '''
         }
         // === END EXTERNAL SOURCES ===
 
-        function editMediaMTXUser(username, password, groupName, permissions, ips) {
+        function editMediaMTXUser(username, password, groupName, permissions, ips, listIndex) {
             // Show the add form
             document.getElementById('add-mediamtx-user-form').style.display = 'block';
             
@@ -5584,7 +5664,10 @@ HTML_TEMPLATE = '''
             const form = document.getElementById('mediamtx-user-form');
             form.dataset.editing = username;
             form.dataset.editingIps = JSON.stringify(ips || []);
-            
+            form.dataset.editingPass = password || '';
+            const listed = listedMediaMTXUsers[listIndex];
+            form.dataset.editingPerms = JSON.stringify(listed ? listed.permissions : null);
+
             // Change button text to "Update User"
             const submitButton = form.querySelector('button[type="submit"]');
             if (submitButton) {
@@ -5595,13 +5678,20 @@ HTML_TEMPLATE = '''
             document.getElementById('add-mediamtx-user-form').scrollIntoView({behavior: 'smooth'});
         }
         
-        function revokeMediaMTXUser(username, ips) {
+        // Users as last listed, so Edit and Revoke can send what tells several
+        // `any` entries apart (their permissions) without an inline onclick.
+        let listedMediaMTXUsers = [];
+
+        function revokeMediaMTXUser(index) {
+            const user = listedMediaMTXUsers[index];
+            if (!user) return;
+            const username = user.user;
             if (!confirm('Revoke access for user: ' + username + '?')) return;
-            
+
             fetch('/api/mediamtx/users/revoke', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({username, ips})
+                body: JSON.stringify({username, ips: user.ips || [], pass: user.pass || '', permissions: user.permissions || []})
             })
             .then(response => response.json())
             .then(data => {
@@ -5652,8 +5742,9 @@ HTML_TEMPLATE = '''
                     });
                     
                     let html = '';
-                    
-                    data.users.forEach(user => {
+                    listedMediaMTXUsers = data.users;
+
+                    data.users.forEach((user, userIndex) => {
                         // Check if this is unprotected (any user with no password)
                         const isUnprotected = user.user === 'any' && (!user.pass || user.pass === '');
                         const borderColor = isUnprotected ? '#ff9800' : '#2196F3';
@@ -5691,7 +5782,7 @@ HTML_TEMPLATE = '''
                         }
                         
                         html += '<p style="margin: 5px 0;"><strong>Permissions:</strong> ';
-                        const perms = user.permissions.map(p => p.action).join(', ');
+                        const perms = user.permissions.map(p => p.path ? p.action + ' (' + escapeHtml(String(p.path).replace(/^["']|["']$/g, '')) + ')' : p.action).join(', ');
                         html += perms || 'None';
                         html += '</p>';
                         html += '</div>';
@@ -5699,7 +5790,7 @@ HTML_TEMPLATE = '''
                         html += '<div style="display: flex; gap: 10px;">';
                         const permsJson = JSON.stringify(user.permissions.map(p => p.action)).replace(/"/g, '&quot;');
                         const ipsJson = JSON.stringify(user.ips || []).replace(/"/g, '&quot;');
-                        html += '<button class="btn btn-secondary" onclick="editMediaMTXUser(\\'' + user.user + '\\', \\'' + (user.pass || '') + '\\', \\'' + (user.groupName || '') + '\\', ' + permsJson + ', ' + ipsJson + ')">✏️ Edit</button>';
+                        html += '<button class="btn btn-secondary" onclick="editMediaMTXUser(\\'' + user.user + '\\', \\'' + (user.pass || '') + '\\', \\'' + (user.groupName || '') + '\\', ' + permsJson + ', ' + ipsJson + ', ' + userIndex + ')">✏️ Edit</button>';
                         
                         // Hide Revoke button for PUBLIC user (controlled by toggle)
                         const isPublicUser = user.user === 'any' && (!user.pass || user.pass === '') && user.groupName === 'PUBLIC';
@@ -5707,7 +5798,7 @@ HTML_TEMPLATE = '''
                         const isHLSViewer = user.user === 'hlsviewer';
                         
                         if (!isPublicUser && !isHLSViewer) {
-                            html += '<button class="btn btn-danger" onclick="revokeMediaMTXUser(\\'' + user.user + '\\', ' + ipsJson + ')">🗑️ Revoke</button>';
+                            html += '<button class="btn btn-danger" onclick="revokeMediaMTXUser(' + userIndex + ')">🗑️ Revoke</button>';
                         } else if (isHLSViewer) {
                             html += '<span style="color: #ff9800; font-size: 13px; margin-left: 10px;">⚠️ System User - Auto-generated for HLS playback (password edit only)</span>';
                         }
@@ -5919,9 +6010,14 @@ HTML_TEMPLATE = '''
             // Resolve relative URL to absolute so the popup (about:blank) can fetch it
             const absoluteUrl = isProxied ? (window.location.origin + streamUrl) : streamUrl;
 
-            // Stream name = second-to-last path segment (.../<name>/index.m3u8)
-            const urlParts = absoluteUrl.split('/');
-            const streamName = urlParts.length >= 2 ? urlParts[urlParts.length - 2] : 'stream';
+            // Stream name = the whole path before /index.m3u8, so nested paths such as
+            // live/drone1 keep their prefix. Taking only the last segment sent WebRTC
+            // to "drone1", a path with no stream on it. The name is written into the
+            // popup's HTML below, so anything outside stream-path characters is dropped.
+            let streamPath = decodeURIComponent(new URL(absoluteUrl).pathname);
+            if (isProxied) streamPath = streamPath.replace(/^[/]hls-proxy/, '');
+            streamPath = streamPath.replace(/^[/]+/, '').replace(/[/]index[.]m3u8$/, '');
+            const streamName = /^[A-Za-z0-9_.~-]+([/][A-Za-z0-9_.~-]+)*$/.test(streamPath) ? streamPath : 'stream';
 
             // playbackConfig is loaded once at page load; default to HLS so a
             // failed/absent fetch can never take the watch button offline.
@@ -5930,7 +6026,7 @@ HTML_TEMPLATE = '''
             // same-origin (no CORS), session-authenticated, and it lets the
             // WebRTC port stay bound to localhost like HLS already is.
             const whepUrl = (playbackConfig && playbackConfig.webrtc_available)
-                ? window.location.origin + '/whep/' + encodeURIComponent(streamName)
+                ? window.location.origin + '/whep/' + streamName.split('/').map(encodeURIComponent).join('/')
                 : '';
 
             console.log('[Watch] Resolved URL:', absoluteUrl, '| proxied:', isProxied, '| mode:', playbackMode);
@@ -6056,9 +6152,9 @@ HTML_TEMPLATE = '''
                                         // 2xx is not proof of playback. Require actual frames.
                                         setTimeout(function() {
                                             if (settled) return;
-                                            if (!video.videoWidth) fail('no video within 6s');
+                                            if (!video.videoWidth) fail('no video within 12s');
                                             else settled = true;
-                                        }, 6000);
+                                        }, 12000);
                                         pc.createOffer().then(function(offer) {
                                             return pc.setLocalDescription(offer).then(function() { return offer; });
                                         }).then(function(offer) {
@@ -8176,6 +8272,19 @@ def read_yaml_field(field_name, default=None):
         print(f"ERROR reading field {field_name}: {e}", flush=True)
     return default
 
+def read_yaml_flag(field_name, default=True):
+    """A top-level on/off switch such as `webrtc:`. The Ubuntu template writes
+    `yes`/`no` but upstream's config (Rocky) writes `true`/`false`, so comparing
+    with 'yes' read every upstream switch as off. A missing or empty key gets
+    MediaMTX's own default, which is on for every protocol."""
+    value = read_yaml_field(field_name, None)
+    if value is None:
+        return default
+    value = str(value).split(' #', 1)[0].strip().lower()
+    if not value:
+        return default
+    return value in ('yes', 'true', 'on')
+
 def read_yaml_users():
     """Read authInternalUsers directly from YAML file without ruamel.yaml.
     Returns a list of user dicts with user, pass, ips, permissions."""
@@ -8364,6 +8473,29 @@ def set_scalar_field(field, value, after_field=None):
         return False
 
 
+def cert_file_exists(path):
+    """True if a TLS cert/key file exists, even where this process can't see it.
+
+    On hardened infra-TAK boxes the editor runs as an unprivileged user that is
+    not in group caddy, so it cannot traverse /var/lib/caddy. os.path.exists()
+    then answers False for Caddy's Let's Encrypt cert, which plainly exists and
+    which MediaMTX itself (group caddy) reads fine - and encryption could never
+    be enabled. A permission error is not absence: ask the infra-TAK broker
+    (`test` is a read-only predicate on its allowlist) before saying no.
+    """
+    try:
+        os.stat(path)
+        return True
+    except PermissionError:
+        pass
+    except OSError:
+        return False
+    if os.geteuid() == 0:
+        return False
+    br = _mtx_broker_exec(['test', '-f', path], timeout=10)
+    return br is not None and br[0] == 0
+
+
 def resolve_existing_cert():
     """Find a TLS cert/key already configured for any protocol on this box.
 
@@ -8378,7 +8510,7 @@ def resolve_existing_cert():
     for proto in ['webrtc', 'hls', 'rtsp', 'rtmp']:
         cert = (config.get(f'{proto}ServerCert') or '').strip()
         key = (config.get(f'{proto}ServerKey') or '').strip()
-        if cert and key and os.path.exists(cert) and os.path.exists(key):
+        if cert and key and cert_file_exists(cert) and cert_file_exists(key):
             return (cert, key)
     return (None, None)
 
@@ -8547,6 +8679,23 @@ def get_backups():
         return files[:10]  # Last 10 backups
     except:
         return []
+
+def backup_config_file(reason):
+    """Copy mediamtx.yml into BACKUP_DIR so it shows up under Restore.
+
+    Call this before anything that rewrites the operator's config on its own
+    (updates, startup auto-patches, rollbacks). The config is the one thing an
+    update must never lose. Returns the backup path, or None if it failed.
+    """
+    try:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        backup_file = os.path.join(BACKUP_DIR, f'mediamtx.yml.{datetime.now().strftime("%Y%m%d_%H%M%S")}')
+        shutil.copy2(CONFIG_FILE, backup_file)
+        print(f"✓ mediamtx.yml backed up before {reason}: {backup_file}", flush=True)
+        return backup_file
+    except Exception as e:
+        print(f"WARNING: could not back up mediamtx.yml before {reason}: {e}", flush=True)
+        return None
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -8943,6 +9092,29 @@ def api_status():
     except:
         return jsonify({'status': 'unknown', 'color': 'secondary'})
 
+def is_legacy_relay_input(path_name, all_names):
+    """True for `live/X` when `X` also exists: the input half of the old FFmpeg
+    relay (publish to live/X, FFmpeg re-published it as X), which is counted as
+    viewers of X rather than listed on its own.
+
+    This used to hide every `live/` path. The relay is gone -- startup strips it
+    from mediamtx.yml -- so a `live/` path is now a real publisher, usually OBS or
+    a DJI drone on RTMP (`rtmp://host/live/<name>`). Those streams were online
+    and recording while Active Streams and the dashboard showed nothing.
+    """
+    return path_name.startswith('live/') and path_name[5:] in all_names
+
+
+STREAM_NAME_RE = re.compile(r'^[A-Za-z0-9_.~-]+(/[A-Za-z0-9_.~-]+)*$')
+
+
+def is_valid_stream_name(name):
+    """Stream path characters, one or more segments (live/drone1), and no `.` or
+    `..` segment that would climb out of the path. Checked wherever a stream name
+    from a URL reaches MediaMTX or is written into a page."""
+    return bool(STREAM_NAME_RE.match(name or '')) and not any(s in ('.', '..') for s in name.split('/'))
+
+
 @app.route('/api/streams')
 @login_required
 def api_streams():
@@ -8980,13 +9152,16 @@ def api_streams():
             # Build a set of all available path names (including live/ paths)
             available_paths = {item.get('name', '') for item in data.get('items', [])}
             
-            # Load external sources metadata once (to filter pull sources from active streams)
-            ext_sources = load_external_sources_metadata()
+            # Load external sources once (to filter pull sources from active streams),
+            # including pulled paths written by hand in mediamtx.yml
+            ext_sources = load_all_external_sources()
             
             for item in data.get('items', []):
                 path_name = item.get('name', '')
-                # Skip internal relay streams and 'all' path
-                if path_name and path_name != 'all' and not path_name.startswith('live/'):
+                # Skip legacy relay inputs and 'all' path
+                # Also skip '<stream>_hls' re-encode sidecars (shown as the base stream)
+                if path_name and path_name != 'all' and not is_legacy_relay_input(path_name, available_paths) \
+                        and not (path_name.endswith('_hls') and path_name[:-4] in available_paths):
                     stream_info = {
                         'name': path_name,
                         'readers': 0,  # Will update from detail call
@@ -9438,6 +9613,17 @@ def api_get_mediamtx_users():
     
     return jsonify({'users': users_list})
 
+# MediaMTX refuses to start on a plain username/password outside this set
+# ("credential contains unsupported characters"), so check before writing.
+MTX_CREDENTIAL_RE = re.compile(r'^[a-zA-Z0-9!$()*+.;<=>\[\]^_\-{}@#&]+$')
+MTX_CREDENTIAL_CHARS = 'letters, digits and ! $ ( ) * + . ; < = > [ ] ^ _ - { } @ # &'
+
+def mtx_credential_error(username, password):
+    for label, value in (('Username', username), ('Password', password)):
+        if value and not value.startswith(('sha256:', 'argon2:')) and not MTX_CREDENTIAL_RE.match(value):
+            return f'{label} can only contain {MTX_CREDENTIAL_CHARS}'
+    return None
+
 @app.route('/api/mediamtx/users/add', methods=['POST'])
 @admin_required
 def api_add_mediamtx_user():
@@ -9447,10 +9633,14 @@ def api_add_mediamtx_user():
     username = data.get('username', '').strip()
     password = data.get('password', '').strip()
     permissions = data.get('permissions', [])
-    
+
     if not username:
         return jsonify({'success': False, 'error': 'Username required'}), 400
-    
+
+    cred_error = mtx_credential_error(username, password)
+    if cred_error:
+        return jsonify({'success': False, 'error': cred_error}), 400
+
     if not permissions:
         return jsonify({'success': False, 'error': 'At least one permission required'}), 400
     
@@ -9479,36 +9669,14 @@ def api_add_mediamtx_user():
             else:
                 return jsonify({'success': False, 'error': 'Username already exists'}), 400
     
-    # Build new user YAML text
-    group_comment = f"# {group_name}\n" if group_name else ""
     # Always quote passwords to prevent YAML type issues (bare numbers break MediaMTX)
     pass_value = f'"{password}"' if password else "''"
-    user_yaml = f"""{group_comment}- user: {username}
-  pass: {pass_value}
-  ips: []
-  permissions:
-"""
-    for perm in permissions:
-        user_yaml += f"  - action: {perm}\n"
-    
-    # Read file and insert before authHTTPAddress
-    with open(CONFIG_FILE, 'r') as f:
-        lines = f.readlines()
-    
-    new_lines = []
-    inserted = False
-    
-    for line in lines:
-        if not inserted and 'authHTTPAddress:' in line:
-            # Insert new user before authHTTPAddress
-            new_lines.append(user_yaml)
-            inserted = True
-        new_lines.append(line)
-    
-    # Write back
-    with open(CONFIG_FILE, 'w') as f:
-        f.writelines(new_lines)
-    
+    entry = [f"- user: {username}", f"  pass: {pass_value}", "  ips: []", "  permissions:"]
+    entry += [f"  - action: {perm}" for perm in permissions]
+
+    if not insert_auth_user_entry(entry, group_name):
+        return jsonify({'success': False, 'error': 'Could not find the authInternalUsers list in mediamtx.yml'}), 500
+
     # Save group metadata
     if group_name:
         group_metadata = load_group_metadata()
@@ -9523,6 +9691,54 @@ def api_add_mediamtx_user():
         pass
     
     return jsonify({'success': True})
+
+def _is_hidden_teststream_viewer(u):
+    return (u.get('user') == 'any' and not list(u.get('ips') or []) and not u.get('pass')
+            and any(p.get('path') == 'teststream' for p in (u.get('permissions') or [])))
+
+
+def _permission_key(perms):
+    """Comparable form of a permission list. Paths are unquoted because the
+    Users tab reads them with read_yaml_users(), which keeps YAML quotes."""
+    return sorted((str(p.get('action') or ''), str(p.get('path') or '').strip('\'"'))
+                  for p in (perms or []) if isinstance(p, dict))
+
+
+def _matches_mediamtx_user(u, username, ips, password=None, permissions=None):
+    """Identify the one user an edit/revoke from the Users tab refers to.
+
+    Several `user: any` entries can share `ips: []` (public access, the hidden
+    teststream viewer, hand-made publish grants). MediaMTX refuses a password on
+    `any`, so they differ only in their permissions: for 'any', the password and
+    permissions the client listed are compared too when it sends them. The
+    teststream viewer is hidden from the Users tab and is never matched here.
+    """
+    if str(u.get('user') or '') != username:
+        return False
+    if _is_hidden_teststream_viewer(u):
+        return False
+    if username != 'any':
+        return True
+    if list(u.get('ips') or []) != list(ips or []):
+        return False
+    if password is not None and str(u.get('pass') or '') != str(password):
+        return False
+    return permissions is None or _permission_key(u.get('permissions')) == _permission_key(permissions)
+
+
+def _merge_permissions(old_perms, actions):
+    """New permission list for the chosen actions, keeping any path scope.
+
+    The Users form only knows action names. Rebuilding as bare {'action': a}
+    turned "publish to live/game only" into "publish anywhere" -- on an 'any'
+    user, that let anyone on the internet publish to any path.
+    """
+    merged = []
+    for action in actions:
+        scoped = [p for p in (old_perms or []) if p.get('action') == action]
+        merged.extend(scoped if scoped else [{'action': action}])
+    return merged
+
 
 @app.route('/api/mediamtx/users/update', methods=['POST'])
 @admin_required
@@ -9540,7 +9756,11 @@ def api_update_mediamtx_user():
         return jsonify({'success': False, 'error': 'Username required'}), 400
     
     # Password can be blank
-    
+
+    cred_error = mtx_credential_error(username, password)
+    if cred_error:
+        return jsonify({'success': False, 'error': cred_error}), 400
+
     if not permissions:
         return jsonify({'success': False, 'error': 'At least one permission required'}), 400
     
@@ -9557,29 +9777,16 @@ def api_update_mediamtx_user():
     if 'authInternalUsers' not in config:
         return jsonify({'success': False, 'error': 'No users configured'}), 400
     
-    # Find the specific user to update (match by username AND ips to handle multiple 'any' users)
+    # Find the specific user to update (see _matches_mediamtx_user for 'any' users)
     user_found = False
     for user in config['authInternalUsers']:
-        if user.get('user') == old_username:
-            # For 'any' users, also check IPs to find the right one
-            if old_username == 'any':
-                user_ips = user.get('ips', [])
-                # Match the specific 'any' user by IPs
-                if user_ips == old_ips:
-                    # Update this user
-                    user['user'] = username
-                    # Force password as quoted string to prevent YAML number parsing
-                    user['pass'] = DoubleQuotedScalarString(str(password)) if password else ''
-                    user['permissions'] = [{'action': perm} for perm in permissions]
-                    user_found = True
-                    break
-            else:
-                # For non-'any' users, just match username
-                user['user'] = username
-                user['pass'] = DoubleQuotedScalarString(str(password)) if password else ''
-                user['permissions'] = [{'action': perm} for perm in permissions]
-                user_found = True
-                break
+        if _matches_mediamtx_user(user, old_username, old_ips, data.get('oldPass'), data.get('oldPermissions')):
+            user['user'] = username
+            # Force password as quoted string to prevent YAML number parsing
+            user['pass'] = DoubleQuotedScalarString(str(password)) if password else ''
+            user['permissions'] = _merge_permissions(user.get('permissions'), permissions)
+            user_found = True
+            break
     
     if not user_found:
         return jsonify({'success': False, 'error': 'User not found'}), 404
@@ -9623,18 +9830,13 @@ def api_revoke_mediamtx_user():
     if username == 'any' and ips and '127.0.0.1' in ips:
         return jsonify({'success': False, 'error': 'Cannot delete localhost exemption (required for FFmpeg)'}), 400
     
-    # Remove the specific user (match by username AND ips for 'any' users)
-    original_count = len(config['authInternalUsers'])
-    if username == 'any':
-        # For 'any' users, match by IPs to delete the right one
-        config['authInternalUsers'] = [u for u in config['authInternalUsers'] 
-                                        if not (u.get('user') == username and u.get('ips', []) == ips)]
-    else:
-        # For other users, just match username
-        config['authInternalUsers'] = [u for u in config['authInternalUsers'] if u.get('user') != username]
-    
-    if len(config['authInternalUsers']) == original_count:
+    # Remove exactly one user. Filtering every 'any' entry with matching IPs also
+    # deleted the hidden teststream viewer, which shares `user: any, ips: []`.
+    idx = next((i for i, u in enumerate(config['authInternalUsers'])
+                if _matches_mediamtx_user(u, username, ips, data.get('pass'), data.get('permissions'))), None)
+    if idx is None:
         return jsonify({'success': False, 'error': 'User not found'}), 404
+    del config['authInternalUsers'][idx]
     
     # Remove from group metadata
     group_metadata = load_group_metadata()
@@ -9782,7 +9984,7 @@ def save_protocols():
             if not cert_key or not cert_file:
                 return redirect(f'/?message=Cannot enable RTSP encryption: Certificate paths not configured!&message_type=danger&tab={tab}')
             
-            if not os.path.exists(cert_key) or not os.path.exists(cert_file):
+            if not cert_file_exists(cert_key) or not cert_file_exists(cert_file):
                 return redirect(f'/?message=Cannot enable RTSP encryption: Certificate files not found!&message_type=danger&tab={tab}')
         
         # WebRTC encryption: reuse the cert Caddy already configured for the
@@ -10074,9 +10276,26 @@ def restore_backup(backup_name):
 @app.route('/stream_logs')
 @login_required
 def stream_logs():
-    """Stream MediaMTX logs in real-time using Server-Sent Events"""
-    def generate():
-        # Start journalctl process
+    """Stream MediaMTX logs in real-time using Server-Sent Events.
+
+    Two defects fixed here, both diagnosed on a customer box (infra-TAK v10.1.68):
+
+      1. journalctl was read on stdout only. The editor runs as the unprivileged
+         console user, which on a hardened box is in no group that can read the
+         journal — journalctl then prints a permissions hint to STDERR and nothing
+         to stdout, so this yielded ZERO bytes: a blank pane with no explanation.
+         stderr is now surfaced as `[log viewer]` lines, so the failure says what
+         it is. (The other half is unit-side: SupplementaryGroups=systemd-journal.)
+      2. No keepalive. A reverse proxy with a short idle timeout kills a response
+         that has sent nothing, EventSource fires onerror, the page reopens, and the
+         user sees "Connection lost. Reconnecting..." forever. MediaMTX itself logs
+         only every ~30s, so even WITH journal access the stream would idle out.
+
+    The `_INFRATAK_SSE_HEARTBEAT` marker below is load-bearing — infra-TAK keys the
+    idempotency of its editor patch on it. See _broker_available().
+    """
+    def generate():  # _INFRATAK_SSE_HEARTBEAT
+        import select as _sel, time as _t
         process = subprocess.Popen(
             ['journalctl', '-u', SERVICE_NAME, '-f', '-n', '50'],
             stdout=subprocess.PIPE,
@@ -10084,15 +10303,48 @@ def stream_logs():
             universal_newlines=True,
             bufsize=1
         )
-        
+        # Say something immediately: a response that sends nothing is what a proxy
+        # kills, and what leaves the pane blank with no explanation.
+        yield ": open\n\n"
+        _open = [process.stdout, process.stderr]
+        _last = _t.monotonic()
         try:
-            for line in iter(process.stdout.readline, ''):
-                if line:
-                    # Send log line as Server-Sent Event
-                    yield f"data: {line.strip()}\n\n"
+            while True:
+                # NOTE: a closed pipe stays permanently "ready" in select(), so a stream
+                # that has hit EOF must be dropped from the set -- otherwise the loop
+                # spins at 100% CPU, never idles, and therefore never heartbeats.
+                _ready = _sel.select(_open, [], [], 1.0)[0] if _open else []
+                _got = False
+                for _fh in list(_ready):
+                    _line = _fh.readline()
+                    if _line == '':
+                        _open.remove(_fh)
+                        continue
+                    _txt = _line.strip()
+                    if not _txt:
+                        continue
+                    if _fh is process.stderr:
+                        yield f"data: [log viewer] {_txt}\n\n"
+                    else:
+                        yield f"data: {_txt}\n\n"
+                    _got = True
+                    _last = _t.monotonic()
+                if _got:
+                    continue
+                if not _open and process.poll() is not None:
+                    yield "data: [log viewer] journalctl exited; stream closed.\n\n"
+                    break
+                if not _open:
+                    _t.sleep(1.0)
+                if _t.monotonic() - _last >= 10:
+                    yield ": ping\n\n"   # keep proxies from idling us out
+                    _last = _t.monotonic()
         finally:
-            process.terminate()
-            process.wait()
+            try:
+                process.terminate()
+                process.wait(timeout=5)
+            except Exception:
+                pass
     
     return app.response_class(generate(), mimetype='text/event-stream')
 
@@ -10927,6 +11179,7 @@ def get_stream_urls():
     # Use domain from cert if available, otherwise use request host (IP)
     domain = stream_info['domain'] if stream_info['domain'] else request.host.split(':')[0]
     protocol = stream_info['protocol']
+    webrtc_port = str(read_yaml_field('webrtcAddress', ':8887')).rsplit(':', 1)[-1] or '8887'
     
     urls = {
         'rtsp': f'rtsp://{domain}:8554/teststream',
@@ -10935,10 +11188,72 @@ def get_stream_urls():
         # Browser-only, video without audio/KLV. MediaMTX serves its own player at
         # this path and the WHEP endpoint at <path>/whep. Only surfaced when the
         # protocol is actually enabled, so the UI never shows a dead link.
-        'webrtc': f'{protocol}://{domain}:8889/teststream' if read_yaml_field('webrtc', 'no') == 'yes' else None
+        'webrtc': f'{protocol}://{domain}:{webrtc_port}/teststream' if read_yaml_flag('webrtc') else None
     }
 
     return jsonify(urls)
+
+
+def find_auth_users_section(lines):
+    """Locate the authInternalUsers list in mediamtx.yml lines.
+
+    Returns (key_idx, end_idx, item_indent) or None. end_idx is one past the last
+    entry's last content line, so comments introducing the next key stay with it.
+    item_indent is the column of the entries' `-`.
+
+    Two layouts are in the field. The Ubuntu installer's template writes entries
+    at column 0 and runs straight into `authHTTPAddress:`; Rocky keeps upstream's
+    mediamtx.yml, which indents entries by 2 and puts a comment block before
+    `authHTTPAddress:`. Writers that assumed the template pasted a column-0 entry
+    after upstream's indented list, which is invalid YAML: MediaMTX won't start
+    and the console can no longer load the config.
+    """
+    key = next((i for i, ln in enumerate(lines) if ln.startswith('authInternalUsers:')), None)
+    if key is None:
+        return None
+    end = key + 1
+    item_indent = None
+    for i in range(key + 1, len(lines)):
+        ln = lines[i].rstrip('\n')
+        stripped = ln.strip()
+        if not stripped or stripped.startswith('#'):
+            continue
+        indent = len(ln) - len(ln.lstrip())
+        if indent == 0 and not stripped.startswith('-'):
+            break
+        if item_indent is None and stripped.startswith('-'):
+            item_indent = indent
+        end = i + 1
+    return (key, end, 2 if item_indent is None else item_indent)
+
+
+def insert_auth_user_entry(entry, comment=None):
+    """Append one user to authInternalUsers in the file's own layout.
+
+    `entry` is the user written for column 0 (`- user: x`, `  pass: ...`); it is
+    shifted to the existing entries' indent. Returns False if there is no block
+    authInternalUsers list to add to.
+    """
+    with open(CONFIG_FILE, 'r') as f:
+        lines = f.readlines()
+    section = find_auth_users_section(lines)
+    if not section:
+        return False
+    key, end, indent = section
+    value = lines[key].split(':', 1)[1].split('#', 1)[0].strip()
+    if value == '[]':
+        lines[key] = 'authInternalUsers:\n'
+    elif value:
+        return False
+    pad = ' ' * indent
+    block = [f"{pad}# {comment}\n"] if comment else []
+    block += [f"{pad}{ln}\n" for ln in entry]
+    if end > 0 and not lines[end - 1].endswith('\n'):
+        lines[end - 1] += '\n'
+    lines[end:end] = block
+    with open(CONFIG_FILE, 'w') as f:
+        f.writelines(lines)
+    return True
 
 
 def find_public_any_block(lines):
@@ -10963,22 +11278,38 @@ def find_public_any_block(lines):
     So identify it structurally rather than by label: `user: any`, no `ips:`
     restriction, no `path:` scope. Anything holding `action: api` is never a
     candidate -- that is infrastructure, not a sharing setting.
+
+    Entries may sit at column 0 (Ubuntu template) or indented (upstream config
+    on Rocky, whose default `any` user is public and carries empty `path:` keys,
+    which scope nothing). See find_auth_users_section().
     """
-    n = len(lines)
-    i = 0
+    section = find_auth_users_section(lines)
+    if not section:
+        return None
+    key, n, _ = section
+    i = key + 1
     while i < n:
-        if lines[i].startswith('- user:'):
+        line = lines[i].rstrip('\n')
+        if line.lstrip().startswith('- user:'):
+            indent = len(line) - len(line.lstrip())
             start = i
-            j = i + 1
-            while j < n and (lines[j].startswith(' ') or lines[j].startswith('  -')):
-                j += 1
+            last = i
+            for j in range(i + 1, n):
+                nxt = lines[j].rstrip('\n')
+                if nxt.strip():
+                    if len(nxt) - len(nxt.lstrip()) <= indent:
+                        break
+                    if not nxt.strip().startswith('#'):
+                        last = j
+            j = last + 1
             entry = lines[start:j]
             body = '\n'.join(entry)
             is_any = entry[0].split(':', 1)[1].strip() == 'any'
             ips_restricted = any(
                 ln.strip().startswith('ips:') and ln.split(':', 1)[1].strip() not in ('[]', '')
                 for ln in entry)
-            has_path = any(ln.strip().startswith('path:') for ln in entry)
+            has_path = any(ln.strip().startswith('path:') and ln.split(':', 1)[1].strip()
+                           for ln in entry)
             has_api = 'action: api' in body
             if is_any and not ips_restricted and not has_path and not has_api:
                 if start > 0 and lines[start - 1].lstrip().startswith('#'):
@@ -11034,36 +11365,12 @@ def toggle_public_access():
             return jsonify({'success': True, 'enabled': False, 'message': 'Public access disabled'})
             
         else:
-            # ENABLE: Add PUBLIC user section
-            # Find the end of authInternalUsers section
-            with open(CONFIG_FILE, 'r') as f:
-                lines = f.readlines()
-            
-            new_lines = []
-            inserted = False
-            
-            for i, line in enumerate(lines):
-                new_lines.append(line)
-                
-                # Find last user before authHTTPAddress
-                if not inserted and 'authHTTPAddress:' in line:
-                    # Insert PUBLIC user before authHTTPAddress
-                    public_user = """# PUBLIC
-- user: any
-  pass: ''
-  ips: []
-  permissions:
-  - action: read
-  - action: publish
-  - action: playback
-"""
-                    new_lines.insert(-1, public_user)
-                    inserted = True
-            
-            # Write back
-            with open(CONFIG_FILE, 'w') as f:
-                f.writelines(new_lines)
-            
+            # ENABLE: Add PUBLIC user at the end of authInternalUsers
+            public_user = ["- user: any", "  pass: ''", "  ips: []", "  permissions:",
+                           "  - action: read", "  - action: publish", "  - action: playback"]
+            if not insert_auth_user_entry(public_user, 'PUBLIC'):
+                return jsonify({'success': False, 'error': 'Could not find the authInternalUsers list in mediamtx.yml'}), 500
+
             # Save to group metadata
             group_metadata = load_group_metadata()
             group_metadata['any'] = 'PUBLIC'
@@ -11295,11 +11602,11 @@ def get_protocols_status():
     """Get enable/disable status for all protocols"""
     try:
         return jsonify({
-            'rtsp': read_yaml_field('rtsp', 'yes') == 'yes',
-            'rtmp': read_yaml_field('rtmp', 'yes') == 'yes',
-            'hls': read_yaml_field('hls', 'yes') == 'yes',
-            'webrtc': read_yaml_field('webrtc', 'yes') == 'yes',
-            'srt': read_yaml_field('srt', 'yes') == 'yes'
+            'rtsp': read_yaml_flag('rtsp'),
+            'rtmp': read_yaml_flag('rtmp'),
+            'hls': read_yaml_flag('hls'),
+            'webrtc': read_yaml_flag('webrtc'),
+            'srt': read_yaml_flag('srt')
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -11319,22 +11626,18 @@ def toggle_protocol():
         value = 'yes' if enabled else 'no'
         subprocess.run(['sed', '-i', f's/^{protocol}: .*/{protocol}: {value}/', CONFIG_FILE], check=True)
 
-        # Turning WebRTC on also pins its signalling to loopback. Installs made
-        # before WebRTC was exposed still carry `webrtcAddress: :8889` from the
-        # old template, and left as-is the listener would come up on every
-        # interface. That is the token-bypass case: MediaMTX has no concept of
-        # our share tokens, so a reachable 8889 lets anyone who knows a stream
-        # name negotiate directly. Playback is unaffected - the console proxies
-        # WHEP over loopback either way.
-        if protocol == 'webrtc' and enabled:
-            try:
-                current = str(read_yaml_field('webrtcAddress', ':8889') or ':8889')
-                port = current.rsplit(':', 1)[-1] or '8889'
-                if not current.startswith('127.0.0.1'):
-                    subprocess.run(['sed', '-i', f's/^webrtcAddress: .*/webrtcAddress: 127.0.0.1:{port}/', CONFIG_FILE], check=True)
-                    print(f"✓ WebRTC signalling bound to 127.0.0.1:{port} (was {current})", flush=True)
-            except Exception as e:
-                print(f"Warning: could not pin webrtcAddress to loopback: {e}", flush=True)
+        # NB: this used to auto-pin webrtcAddress to `127.0.0.1:<port>` on
+        # every WebRTC-on toggle, to keep :8887 off the public interface.
+        # DO NOT re-add that pin here: standalone mediamtx runs Dockerized
+        # (bridge network, not --network host). A `127.0.0.1:<port>` bind is
+        # container-internal loopback only - Docker's host->container port
+        # forward can never reach it, so pinning would silently break WHEP
+        # for everyone (whep_negotiate()'s proxy hop would time out/refuse).
+        # The "don't expose signalling publicly" goal is already met by
+        # publishing the container's bind-all webrtcAddress port as
+        # 127.0.0.1:<port>:<port> in docker-compose.yml (host-loopback-only).
+        # webrtcAddress itself
+        # must stay bind-all (":<port>") for that publish to work at all.
 
         # Auto-manage UFW for protocol ports
         protocol_ports = {
@@ -11343,9 +11646,9 @@ def toggle_protocol():
             'hls': [('8888', 'tcp')],
             'srt': [('8890', 'udp')],
             # 8189/udp only. WHEP signalling is proxied via /whep/<stream> and
-            # /shared/<token>/whep, so 8889 is reached over loopback and must
+            # /shared/<token>/whep, so 8887 is reached over loopback and must
             # NOT be published: MediaMTX knows nothing about share tokens, so a
-            # public 8889 lets anyone who guesses a stream name negotiate a
+            # public 8887 lets anyone who guesses a stream name negotiate a
             # session directly and read it, making the token check decorative.
             # 8189 carries media only and is safe - no media flows without a
             # negotiated session, and negotiating requires passing the proxy.
@@ -11414,10 +11717,100 @@ def get_recording_settings():
         print(f"Error reading recording settings: {e}")
         return jsonify({'enabled': False, 'retention': '168h'})
 
+def _set_path_defaults_keys(text, updates):
+    """Update-or-insert scalar keys inside the top-level `pathDefaults:` block.
+
+    This replaces four `sed -i '/^  record:/c\\  record: yes'` calls that could only
+    ever UPDATE. sed's `c` command rewrites a line that already matches and does
+    nothing at all when the key is absent, so on a config whose pathDefaults block
+    had been trimmed down (one in the field carried only `rtspDemuxMpegts: true`)
+    every recording setting was swallowed silently and the toggle read back as off.
+
+    Scoped deliberately to the TOP-LEVEL block: `paths:` -> `<stream>:` -> `record:`
+    is a per-path override living at a deeper indent, and must not be touched.
+
+    `updates` is a list of (key, value) pairs, applied in order. Returns the new
+    text, or None if the result would not parse as YAML (in which case the caller
+    leaves the config alone rather than writing something MediaMTX cannot load).
+    """
+    from io import StringIO
+
+    lines = text.splitlines(keepends=True)
+
+    def _is_top_level(line):
+        return line.strip() != '' and not line[:1].isspace()
+
+    # Locate the top-level `pathDefaults:` key - not a comment, not a nested one.
+    start = None
+    for i, line in enumerate(lines):
+        if _is_top_level(line) and re.match(r'^pathDefaults:\s*(#.*)?$', line):
+            start = i
+            break
+
+    if start is None:
+        # No block at all: build one and put it just before `paths:`, which is where
+        # MediaMTX's own shipped config keeps it. Falls back to appending at EOF.
+        block = ['pathDefaults:\n'] + ['  {}: {}\n'.format(k, v) for k, v in updates] + ['\n']
+        insert_at = len(lines)
+        for i, line in enumerate(lines):
+            if _is_top_level(line) and re.match(r'^paths:\s*(#.*)?$', line):
+                insert_at = i
+                break
+        if insert_at == len(lines) and lines and not lines[-1].endswith('\n'):
+            lines[-1] += '\n'
+        lines[insert_at:insert_at] = block
+    else:
+        # The block runs until the next line that starts in column 0.
+        end = len(lines)
+        for i in range(start + 1, len(lines)):
+            if _is_top_level(lines[i]):
+                end = i
+                break
+
+        # Take the indent from the block's existing children rather than assuming two
+        # spaces, so an inserted key lines up with its siblings instead of splitting
+        # the mapping across two indent levels (a YAML error, not a cosmetic one).
+        indent = '  '
+        for i in range(start + 1, end):
+            m = re.match(r'^(\s+)[A-Za-z_][A-Za-z0-9_]*:', lines[i])
+            if m:
+                indent = m.group(1)
+                break
+
+        missing = []
+        for key, value in updates:
+            pattern = re.compile(r'^' + re.escape(indent) + re.escape(key) + r':')
+            for i in range(start + 1, end):
+                if pattern.match(lines[i]):
+                    lines[i] = '{}{}: {}\n'.format(indent, key, value)
+                    break
+            else:
+                missing.append('{}{}: {}\n'.format(indent, key, value))
+
+        if missing:
+            # Append after the block's last non-blank line, so the shipped config's
+            # comment headers stay attached to the settings they describe.
+            anchor = start
+            for i in range(start + 1, end):
+                if lines[i].strip():
+                    anchor = i
+            if not lines[anchor].endswith('\n'):
+                lines[anchor] += '\n'
+            lines[anchor + 1:anchor + 1] = missing
+
+    new_text = ''.join(lines)
+    try:
+        yaml.load(StringIO(new_text))
+    except Exception:
+        return None
+    return new_text
+
+
 @app.route('/api/recordings/settings', methods=['POST'])
 @login_required
 def save_recording_settings():
-    """Save recording settings to MediaMTX config using sed (avoids ruamel.yaml corruption)"""
+    """Save recording settings to MediaMTX config by editing the file's lines directly
+    (never a ruamel round-trip, which would reflow the config and drop its comments)."""
     try:
         data = request.get_json()
         enabled = data.get('enabled', False)
@@ -11435,21 +11828,34 @@ def save_recording_settings():
         # Ensure recordings directory exists
         os.makedirs(RECORDINGS_DIR, exist_ok=True)
         
-        # Use sed to update settings in place (safe, doesn't corrupt YAML)
-        commands = [
-            # Update or add record setting
-            f"sed -i '/^  record:/c\\  record: {record_value}' {CONFIG_FILE}",
-            # Update or add recordPath
-            f"sed -i '/^  recordPath:/c\\  recordPath: {record_path}' {CONFIG_FILE}",
-            # Update or add recordFormat  
-            f"sed -i '/^  recordFormat:/c\\  recordFormat: {record_format}' {CONFIG_FILE}",
-            # Update or add recordDeleteAfter
-            f"sed -i '/^  recordDeleteAfter:/c\\  recordDeleteAfter: {retention}' {CONFIG_FILE}",
-        ]
-        
-        for cmd in commands:
-            subprocess.run(cmd, shell=True, check=True)
-        
+        # Write the four keys into the top-level pathDefaults block, INSERTING any that
+        # are missing. The previous implementation shelled out to
+        # `sed -i '/^  record:/c\\  record: yes'` four times and was documented as
+        # "update or add", but sed's `c` command can only rewrite a line that already
+        # matches. On a config with no record keys in pathDefaults, all four commands
+        # succeeded and changed nothing, so "Auto record streams" would not stay
+        # selected: the save reported success and the next read found no `record:` key
+        # and answered false. Doing it in Python also drops a shell round-trip per key
+        # and no longer needs write permission on /usr/local/etc itself (`sed -i`
+        # rewrites the directory entry, a plain write does not).
+        with open(CONFIG_FILE, 'r') as f:
+            original = f.read()
+
+        updated = _set_path_defaults_keys(original, [
+            ('record', record_value),
+            ('recordPath', record_path),
+            ('recordFormat', record_format),
+            ('recordDeleteAfter', retention),
+        ])
+        if updated is None:
+            return jsonify({'success': False,
+                            'error': f'Recording settings not saved: the result would not be '
+                                     f'valid YAML. {CONFIG_FILE} was left unchanged.'}), 500
+
+        if updated != original:
+            with open(CONFIG_FILE, 'w') as f:
+                f.write(updated)
+
         # Restart MediaMTX to apply changes
         mtx_restart_checked()
         
@@ -11910,6 +12316,88 @@ def check_for_update():
             'error': str(e)
         })
 
+# Every directory infra-TAK has installed itself to. start.sh runs from wherever the
+# repo was cloned, so older root installs live in a home dir; born-non-root installs
+# (infra-TAK v10.0.5+) relocate to /opt/infratak. A box can carry several clones at
+# once (a stale /root/infra-TAK next to the live /opt/infratak), so the running
+# console's own WorkingDirectory is asked first and the rest are fallbacks.
+INFRA_TAK_INSTALL_DIRS = [
+    '/opt/infratak',
+    '/root/infra-TAK',
+    '/home/takwerx/infra-TAK',
+    '/opt/infra-TAK',
+    '/home/ubuntu/infra-TAK',
+    '/home/admin/infra-TAK',
+]
+
+
+def _infra_tak_console_dir():
+    """The live infra-TAK console's install dir, from its systemd unit, or None."""
+    try:
+        r = subprocess.run(['systemctl', 'show', 'takwerx-console', '--property=WorkingDirectory'],
+                           capture_output=True, text=True, timeout=5)
+        wd = r.stdout.strip().split('=', 1)[-1].strip()
+        return wd or None
+    except Exception:
+        return None
+
+
+def resync_ldap_overlay(overlay_file='/opt/mediamtx-webeditor/mediamtx_ldap_overlay.py'):
+    """Refresh the infra-TAK LDAP overlay after an editor update, never downgrading it.
+
+    Looks in every infra-TAK install dir, takes the newest overlay by mtime, and copies
+    it only when it differs from the installed one AND is newer. The installed copy is
+    written by infra-TAK's own console on every console update, so a source older than
+    it is a stale clone: copying it back once put a March overlay on a box running the
+    October one. Returns (synced, message); the message says what was picked and why.
+    """
+    dirs = []
+    console_dir = _infra_tak_console_dir()
+    for d in ([console_dir] if console_dir else []) + INFRA_TAK_INSTALL_DIRS:
+        if d not in dirs:
+            dirs.append(d)
+
+    found = []  # (mtime, path)
+    seen = set()
+    for d in dirs:
+        path = os.path.join(d, 'mediamtx_ldap_overlay.py')
+        try:
+            real = os.path.realpath(path)
+            if real in seen or real == os.path.realpath(overlay_file) or not os.path.isfile(path):
+                continue
+            seen.add(real)
+            found.append((os.path.getmtime(path), path))
+        except OSError:
+            continue  # unreadable (e.g. /root as an unprivileged editor): skip it
+
+    if not found:
+        return False, f'no infra-TAK overlay found (looked in {", ".join(dirs)}); left as is'
+
+    def _stamp(t):
+        return datetime.fromtimestamp(t).strftime('%Y-%m-%d %H:%M')
+
+    src_mtime, src = max(found)
+    others = ', '.join(f'{p} ({_stamp(t)})' for t, p in sorted(found, reverse=True) if p != src)
+    picked = f'picked {src} ({_stamp(src_mtime)})' + (f' over {others}' if others else '')
+
+    try:
+        with open(src, 'rb') as f:
+            want = f.read()
+        with open(overlay_file, 'rb') as f:
+            have = f.read()
+        have_mtime = os.path.getmtime(overlay_file)
+    except OSError as e:
+        return False, f'{picked}; could not compare with {overlay_file}: {e}'
+
+    if want == have:
+        return False, f'{picked}; installed overlay already matches'
+    if src_mtime <= have_mtime:
+        return False, (f'{picked}; installed overlay is newer ({_stamp(have_mtime)}), '
+                       f'not replacing it with an older one')
+    shutil.copy2(src, overlay_file)
+    return True, f'{picked}; replaced installed overlay from {_stamp(have_mtime)}'
+
+
 @app.route('/api/update/apply', methods=['POST'])
 @admin_required
 def apply_update():
@@ -11955,10 +12443,12 @@ def apply_update():
         with open(temp_file, 'wb') as f:
             f.write(new_code)
         
-        # Step 4: Backup current version
+        # Step 4: Backup current version, and the MediaMTX config with it: the
+        # new version's startup auto-patches may edit mediamtx.yml.
         if os.path.exists(webeditor_file):
             shutil.copy2(webeditor_file, backup_file)
-        
+        config_backup = backup_config_file(f'updating the web editor to {new_version}')
+
         # Step 5: Replace with new version
         shutil.copy2(temp_file, webeditor_file)
         os.chmod(webeditor_file, 0o644)
@@ -11993,20 +12483,14 @@ def apply_update():
 
         # Step 7: Re-sync LDAP overlay if this is an infra-TAK install
         overlay_synced = False
+        overlay_msg = ''
         overlay_file = '/opt/mediamtx-webeditor/mediamtx_ldap_overlay.py'
         if os.path.exists(overlay_file):
             try:
-                infra_tak_overlay = None
-                for candidate in ['/root/infra-TAK/mediamtx_ldap_overlay.py',
-                                  '/opt/infra-TAK/mediamtx_ldap_overlay.py']:
-                    if os.path.exists(candidate):
-                        infra_tak_overlay = candidate
-                        break
-                if infra_tak_overlay:
-                    shutil.copy2(infra_tak_overlay, overlay_file)
-                    overlay_synced = True
-                    print(f"✓ LDAP overlay re-synced from {infra_tak_overlay}", flush=True)
+                overlay_synced, overlay_msg = resync_ldap_overlay(overlay_file)
+                print(f"{'✓' if overlay_synced else 'INFO:'} LDAP overlay: {overlay_msg}", flush=True)
             except Exception as oe:
+                overlay_msg = f'failed to re-sync: {oe}'
                 print(f"WARNING: Failed to re-sync LDAP overlay: {oe}", flush=True)
         
         # Step 8: Restart the web editor onto the new file. Scheduled after the
@@ -12019,7 +12503,9 @@ def apply_update():
             'success': True,
             'new_version': new_version,
             'backup_file': backup_file,
+            'config_backup': config_backup,
             'overlay_synced': overlay_synced,
+            'overlay_message': overlay_msg,
             'restarted': restarted,
             # Reported so the UI can say the update landed but is NOT yet live.
             # Claiming success here while the old process keeps serving is how a
@@ -12496,6 +12982,35 @@ def mtx_copy_priv(src, dst):
         raise RuntimeError('broker cp failed: ' + (err.decode(errors='replace').strip() or 'cp')[:200])
 
 
+def _broker_available():  # _MTX_PROBE_V2
+    """True when the infra-TAK privilege broker is reachable AND will run our commands.
+
+    GH takwerx/infra-TAK#67 (mighkel, 2026-09-08, hardened Ubuntu 22.04 box): this used to
+    probe with `true`, which is not on the broker's EXEC_ALLOW. Every probe was a DENY in the
+    broker audit log, and the editor concluded the broker was unavailable and fell back to
+    `sudo` — which on a hardened box has no password and cannot work, so /api/deps/status
+    filled the journal with PAM auth failures on EVERY poll.
+
+    We do NOT ask for a broker allowlist exception, and the reporter explicitly did not
+    request one either. The fix is caller-side: probe with something the broker already
+    permits. Two other forms were tried and are wrong, so do not "simplify" back to them:
+    the broker's own {'op': 'ping'} looks right in its source but is not served on the
+    socket, so the probe just timed out; and `true` is the original bug. `systemctl` is
+    verb-gated rather than unit-gated, `is-active` is an allowed verb, and asking about
+    takwerx-broker itself says what we actually want to know — is the broker there. It
+    answers in ~10ms and audits as ALLOW on both distro families.
+
+    Only "did the daemon reply" matters, never the exit status: a DENIED answer still comes
+    back as a tuple, and a box with no broker fails to connect and gets None.
+
+    The `_MTX_PROBE_V2` marker above is load-bearing. infra-TAK's console carries a
+    text-surgery patch that rewrites this file on deployed boxes, and keys its idempotency
+    on that marker; with it present, the patch sees the fix is already upstream and leaves
+    the file alone. Do not remove it while infra-TAK <= v10.1.68 is in the field.
+    """
+    return _mtx_broker_exec(['systemctl', 'is-active', 'takwerx-broker'], timeout=5) is not None
+
+
 def mtx_priv_mode():
     """'root' = privileged ops work in-process; 'broker' = infra-TAK broker
     socket is reachable; 'helper' = the sudo helper is provisioned; None = no
@@ -12664,7 +13179,7 @@ def mtx_install_binary(src_path):
     # (the broker won't cp from /tmp), then have the broker back up + swap + chmod.
     # The candidate is NEVER executed as root anywhere in this path — the broker
     # only cp's it into place; the mediamtx service then runs it as takwerx.
-    if _mtx_broker_exec(['true'], timeout=5) is not None:
+    if _broker_available():
         stage_dir = os.path.join(os.path.dirname(MTX_BIN_BACKUP_DIR), 'binstage')
         os.makedirs(stage_dir, exist_ok=True)
         staged = os.path.join(stage_dir, 'mediamtx')
@@ -12741,7 +13256,7 @@ def schedule_editor_self_restart(delay=1.5):
         _later(_root_restart)
         return True
 
-    if _mtx_broker_exec(['true'], timeout=5) is not None:
+    if _broker_available():
         def _broker_restart():
             br = _mtx_broker_exec(['systemctl', 'restart', 'mediamtx-webeditor'], timeout=25)
             if br is not None and br[0] == 0:
@@ -13160,9 +13675,13 @@ def rollback_mediamtx():
             return jsonify({'success': False, 'error': 'Could not stop MediaMTX: ' + (err or 'systemctl stop failed')}), 500
         time.sleep(2)
 
-        # Backup current YAML before we modify anything (so we can undo rollback)
+        # Backup current YAML before we modify anything (so we can undo rollback).
+        # pre_rollback is deleted on success, so also keep a copy under Restore:
+        # the rollback puts back the config from upgrade time, and any edits made
+        # since would otherwise be gone for good.
         pre_rollback_yaml = f'{CONFIG_FILE}.pre_rollback'
         mtx_copy_priv(CONFIG_FILE, pre_rollback_yaml)
+        backup_config_file('rolling back MediaMTX')
 
         # Restore binary
         mtx_install_binary(latest_backup)
@@ -13440,12 +13959,21 @@ def _detect_gstreamer():
 
 def _pkg_update_available(pkgs, refresh=False):
     """Best-effort: is a newer version available for any of pkgs? Uses cached
-    metadata unless refresh=True (which needs sudo and is slower)."""
+    metadata unless refresh=True (which needs root and is slower).
+
+    The refresh used to go through `sudo` unconditionally. On a hardened infra-TAK box
+    that can never succeed — there is no sudo for the console user — so the metadata was
+    never actually refreshed, the "up to date" verdict was unverified, and every refresh
+    added another PAM auth failure to the journal (GH infra-TAK#67). Prefer the broker
+    there; sudo stays the path for standalone installs."""
     pm = _host_pkg_mgr()
     try:
         if pm == 'apt':
             if refresh:
-                _run_quiet(['apt-get', 'update', '-qq'], timeout=120, use_sudo=True)
+                if _broker_available():
+                    _mtx_broker_exec(['apt-get', 'update', '-qq'], timeout=120)
+                else:
+                    _run_quiet(['apt-get', 'update', '-qq'], timeout=120, use_sudo=True)
             for p in pkgs:
                 _, out = _run_quiet(['apt-cache', 'policy', p], timeout=20)
                 inst = cand = None
@@ -13460,7 +13988,10 @@ def _pkg_update_available(pkgs, refresh=False):
             return False
         elif pm == 'dnf':
             if refresh:
-                _run_quiet(['dnf', '-q', 'makecache'], timeout=120, use_sudo=True)
+                if _broker_available():
+                    _mtx_broker_exec(['dnf', '-q', 'makecache'], timeout=120)
+                else:
+                    _run_quiet(['dnf', '-q', 'makecache'], timeout=120, use_sudo=True)
             code, _ = _run_quiet(['dnf', '-q', 'check-update'] + list(pkgs), timeout=60)
             return code == 100  # dnf: 100 = updates available
     except Exception:
@@ -13480,21 +14011,21 @@ def deps_status():
     pkgs = DEPS_PACKAGES.get(pm, {})
     ff['update_available'] = _pkg_update_available(pkgs.get('ffmpeg', []), refresh) if ff['installed'] else False
     gs['update_available'] = _pkg_update_available(pkgs.get('gstreamer', []), refresh) if gs['installed'] else False
-    # Can this console actually install packages? (root, or passwordless sudo.)
-    # On managed infra-TAK boxes the console runs as a non-sudo user — there the
-    # deps come from the infra-TAK deploy, so we hide the in-UI install button.
+    # Can this console actually install packages? (root, the broker, or passwordless sudo.)
+    #
+    # Order matters, and it is the reverse of what it used to be (GH infra-TAK#67). This route
+    # is polled continuously by the page, so a `sudo -n` probe here runs on every poll — on a
+    # hardened infra-TAK box that is a PAM auth failure per poll, filling the journal, and it
+    # can never succeed there anyway. The broker IS the privileged path on those boxes, so ask
+    # it first and only fall back to sudo on a standalone box that has no broker at all.
     can_install = (os.geteuid() == 0)
+    if not can_install:
+        can_install = _broker_available()
     if not can_install:
         try:
             can_install = subprocess.run(['sudo', '-n', 'true'], capture_output=True, timeout=5).returncode == 0
         except Exception:
             can_install = False
-    # infra-TAK hardened boxes have no sudo but do have the privilege broker,
-    # which mediates package installs. Without this the button stayed hidden and
-    # the deps were unreachable from the UI on exactly the boxes that most need
-    # a one-click path, since nobody can ssh in and dnf on a managed host.
-    if not can_install:
-        can_install = _mtx_broker_exec(['true'], timeout=5) is not None
     return jsonify({'pkg_mgr': pm, 'can_install': can_install, 'ffmpeg': ff, 'gstreamer': gs})
 
 
@@ -13523,32 +14054,35 @@ def deps_update():
         # a Rocky 9.8 box that it permits `dnf install` and writes into
         # /usr/lib64/gstreamer-1.0.
         privileged = (os.geteuid() == 0)
+        use_broker = False
         if not privileged:
+            # Broker first — see _broker_available(). On a hardened box `sudo -n` cannot
+            # succeed and only costs a PAM failure in the journal (GH infra-TAK#67).
+            use_broker = _broker_available()
+        if not privileged and not use_broker:
             try:
                 privileged = subprocess.run(['sudo', '-n', 'true'], capture_output=True, timeout=5).returncode == 0
             except Exception:
                 privileged = False
 
-        use_broker = False
-        if not privileged:
-            use_broker = _mtx_broker_exec(['true'], timeout=5) is not None
-
         if use_broker:
             if pm == 'apt':
-                # apt MUST be told not to prompt. Without DEBIAN_FRONTEND
-                # noninteractive it can stop on a debconf question and sit there
-                # until the timeout -- long past any reverse proxy's limit, so the
-                # browser gets an HTML gateway error instead of our JSON and the
-                # page reports "Unexpected token '<'". `env` may not be on the
-                # broker's allowlist, so fall back to apt's own non-interactive
-                # switches, which cover the common config-file prompts.
+                # apt MUST be told not to prompt, or it stops on a debconf question and sits
+                # there past any reverse proxy's limit — the browser then gets an HTML gateway
+                # error instead of our JSON and the page reports "Unexpected token '<'".
+                #
+                # Neither of the two things that used to be wrapped around this call is needed,
+                # and both were REJECTED by the broker (GH infra-TAK#67):
+                #   * `env DEBIAN_FRONTEND=noninteractive` — the broker is in EXEC_DENY as an
+                #     exec wrapper, and it is redundant: the broker already injects
+                #     DEBIAN_FRONTEND=noninteractive and NEEDRESTART_MODE=l for apt/apt-get.
+                #   * `-o Dpkg::Options::=--force-conf{def,old}` — denied by the broker's
+                #     package-manager check as a hook-command escalation vector, with a second
+                #     check rejecting any argument containing `::`. Reshaping the flag cannot
+                #     get through, so the approach is dropped rather than renamed; plain
+                #     `apt-get install -y -q` behaves the same way through the broker.
                 _mtx_broker_exec(['apt-get', 'update', '-qq'], timeout=180)
-                apt_args = ['apt-get', 'install', '-y', '-q',
-                            '-o', 'Dpkg::Options::=--force-confdef',
-                            '-o', 'Dpkg::Options::=--force-confold'] + pkgs
-                br = _mtx_broker_exec(['env', 'DEBIAN_FRONTEND=noninteractive'] + apt_args, timeout=600)
-                if br is None or br[0] != 0:
-                    br = _mtx_broker_exec(apt_args, timeout=600)
+                br = _mtx_broker_exec(['apt-get', 'install', '-y', '-q'] + pkgs, timeout=600)
             else:
                 br = _mtx_broker_exec(['dnf', 'install', '-y'] + pkgs, timeout=600)
             if br is None:
@@ -13866,6 +14400,172 @@ def klv_runon_lines(klv):
     )
 
 
+SOURCE_URL_SCHEMES = ('srt://', 'rtsp://', 'rtsps://', 'udp://', 'udp+mpegts://',
+                      'rtmp://', 'rtmps://', 'http://', 'https://')
+UDP_SOURCE_SCHEMES = ('udp://', 'udp+mpegts://')
+# MediaMTX's own UDP listeners (RTP/RTCP, WebRTC, SRT): never close these for a source.
+MTX_RESERVED_UDP_PORTS = {8000, 8001, 8189, 8890}
+
+
+def validate_source_url(source_url):
+    """Return an error message for a pulled-source URL, or None if it is usable.
+
+    The URL is written unquoted into mediamtx.yml, so anything that could break
+    out of the YAML scalar (whitespace, newlines, quotes, '#') is refused.
+    """
+    if not source_url.startswith(SOURCE_URL_SCHEMES):
+        return 'Unsupported URL scheme. Supported: SRT, RTSP, UDP / multicast MPEG-TS, RTMP, HLS'
+    if re.search(r'[\s"\'#`]', source_url) or any(ord(c) < 32 or ord(c) == 127 for c in source_url):
+        return 'Source URL must not contain spaces, quotes, # or control characters (percent-encode them)'
+    try:
+        u = urlparse(source_url)
+        port = u.port
+    except ValueError:
+        return 'Source URL has an invalid port (must be 1-65535)'
+    if not u.hostname:
+        return 'Source URL is missing the host'
+    if port is not None and not (0 < port < 65536):
+        return 'Source URL has an invalid port (must be 1-65535)'
+    if source_url.startswith(UDP_SOURCE_SCHEMES + ('srt://',)) and port is None:
+        return 'Source URL is missing the port (e.g. udp+mpegts://239.0.0.1:9000)'
+    if source_url.startswith(UDP_SOURCE_SCHEMES):
+        import ipaddress
+        params = dict(p.split('=', 1) if '=' in p else (p, '') for p in u.query.split('&') if p)
+        if params.get('source'):
+            try:
+                ipaddress.ip_address(params['source'])
+            except ValueError:
+                return 'UDP source filter must be an IP address'
+        if 'interface' in params and not re.match(r'^[A-Za-z0-9_.:-]{1,15}$', params['interface']):
+            return 'UDP interface must be a network interface name (e.g. eth0)'
+    return None
+
+
+def udp_listen_port(source_url):
+    """Port a UDP (unicast or multicast) source listens on, or None for other protocols."""
+    if not source_url.startswith(UDP_SOURCE_SCHEMES):
+        return None
+    try:
+        return urlparse(source_url).port
+    except ValueError:
+        return None
+
+
+def _firewall_run(argv, timeout=20):
+    """Run a ufw / firewall-cmd command as root: in-process when root, else via the
+    infra-TAK broker (hardened boxes, console unprivileged), else sudo -n. Returns
+    (returncode, error_text)."""
+    if os.geteuid() == 0:
+        r = subprocess.run(argv, capture_output=True, timeout=timeout)
+        return r.returncode, r.stderr.decode(errors='replace')
+    br = _mtx_broker_exec(argv, timeout=timeout)
+    if br is not None:
+        return br[0], br[2].decode(errors='replace')
+    r = subprocess.run(['sudo', '-n'] + argv, capture_output=True, timeout=timeout)
+    return r.returncode, r.stderr.decode(errors='replace')
+
+
+def set_udp_firewall(port, allow):
+    """Best effort: open or close a UDP port in ufw (Ubuntu) or firewalld (Rocky).
+
+    Returns '' on success or when there is nothing to do, else a short warning
+    for the operator (the source itself is saved either way)."""
+    if not port or (not allow and port in MTX_RESERVED_UDP_PORTS):
+        return ''
+    try:
+        if shutil.which('ufw'):
+            rc, err = _firewall_run(['ufw', 'allow', f'{port}/udp'] if allow else ['ufw', 'delete', 'allow', f'{port}/udp'])
+        elif shutil.which('firewall-cmd'):
+            # Runtime + permanent, no --reload: a reload briefly drops outbound
+            # traffic and kills local senders (e.g. ffmpeg to a multicast group).
+            op = '--add-port' if allow else '--remove-port'
+            rc, err = _firewall_run(['firewall-cmd', f'{op}={port}/udp'])
+            if rc == 0:
+                rc, err = _firewall_run(['firewall-cmd', '--permanent', f'{op}={port}/udp'])
+        else:
+            return ''
+    except Exception as e:
+        rc, err = 1, str(e)
+    if rc == 0:
+        print(f"✓ Firewall: {'allowed' if allow else 'removed'} {port}/udp", flush=True)
+        return ''
+    print(f"Warning: could not {'open' if allow else 'close'} {port}/udp in the firewall: {err.strip()[:200]}", flush=True)
+    if allow:
+        return f'Could not open UDP port {port} in the firewall. Allow {port}/udp by hand, or the stream will not arrive.'
+    return ''
+
+
+def yaml_pulled_sources():
+    """Paths in mediamtx.yml that pull from a URL but were not added through this tab.
+
+    Lets hand-written entries such as
+        stream1:
+          source: udp://239.0.0.1:9000
+    show up (and be edited / removed) under External Sources and Active Streams.
+    Only 2-space-indented path headers are picked up, because that is what the
+    line-based edit / delete code below can rewrite safely.
+    """
+    found = {}
+    try:
+        with open(CONFIG_FILE, 'r') as f:
+            content = f.read()
+        paths = (YAML(typ='safe').load(content) or {}).get('paths') or {}
+        if not isinstance(paths, dict):
+            return {}
+        for name, conf in paths.items():
+            if not isinstance(name, str) or not isinstance(conf, dict):
+                continue
+            if name in ('all', 'all_others') or not re.match(r'^[A-Za-z0-9_./-]+$', name):
+                continue
+            src = conf.get('source')
+            if not isinstance(src, str) or not src.startswith(SOURCE_URL_SCHEMES):
+                continue
+            if not re.search(r'^  ' + re.escape(name) + r':\s*$', content, re.MULTILINE):
+                continue
+            od = conf.get('sourceOnDemand', False)
+            found[name] = {
+                'source_url': src,
+                'on_demand': od is True or str(od).lower() in ('yes', 'true'),
+                'enabled': True,
+                'klv': None,
+                'from_yaml': True,
+            }
+    except Exception as e:
+        print(f"Warning: could not scan mediamtx.yml for pulled sources: {e}", flush=True)
+    return found
+
+
+def load_all_external_sources():
+    """External sources metadata plus pulled-source paths written by hand in mediamtx.yml."""
+    sources = load_external_sources_metadata()
+    for name, meta in yaml_pulled_sources().items():
+        sources.setdefault(name, meta)
+    return sources
+
+
+def load_external_sources_for(name):
+    """Metadata for a mutating endpoint: adopts `name` if it is a hand-written yml path."""
+    sources = load_external_sources_metadata()
+    if name not in sources:
+        meta = yaml_pulled_sources().get(name)
+        if meta:
+            meta.pop('from_yaml', None)
+            meta['adopted'] = True  # its firewall rule (if any) is the operator's, not ours
+            sources[name] = meta
+    return sources
+
+
+def closes_own_firewall_rule(meta):
+    """True when deleting / re-porting this source should close its UDP port: the
+    editor opened it (sources added before v2.1.9 never adopted, so assume ours)."""
+    return bool(meta.get('firewall_opened')) or not meta.get('adopted')
+
+
+def udp_port_in_use(port):
+    """True when another configured source (metadata or hand-written) still listens on port."""
+    return port in {udp_listen_port(m.get('source_url', '')) for m in load_all_external_sources().values()}
+
+
 def rtsp_transport_line(source_url):
     """YAML rtspTransport line for RTSP pulls, or '' for other protocols.
 
@@ -13965,8 +14665,8 @@ def api_netbird_disconnect():
 def api_list_external_sources():
     """List all configured external sources with their connection status"""
     try:
-        sources_metadata = load_external_sources_metadata()
-        
+        sources_metadata = load_all_external_sources()
+
         if not sources_metadata:
             return jsonify({'sources': []})
         
@@ -14002,7 +14702,8 @@ def api_list_external_sources():
                 'on_demand': meta.get('on_demand', False),
                 'enabled': enabled,
                 'status': source_status,
-                'klv': meta.get('klv') or None
+                'klv': meta.get('klv') or None,
+                'from_yaml': bool(meta.get('from_yaml'))
             })
         
         return jsonify({'sources': sources})
@@ -14028,13 +14729,11 @@ def api_add_external_source():
         if not source_url:
             return jsonify({'success': False, 'error': 'Source URL is required'}), 400
         
-        # Validate URL scheme
-        valid_schemes = ['srt://', 'rtsp://', 'rtsps://', 'udp+mpegts://', 'rtmp://', 'rtmps://', 'http://', 'https://']
-        if not any(source_url.startswith(s) for s in valid_schemes):
-            return jsonify({'success': False, 'error': f'Unsupported URL scheme. Supported: SRT, RTSP, UDP MPEG-TS, RTMP, HLS'}), 400
-        
+        url_err = validate_source_url(source_url)
+        if url_err:
+            return jsonify({'success': False, 'error': url_err}), 400
+
         # Validate name: lowercase, numbers, underscores
-        import re
         if not re.match(r'^[a-z0-9_]+$', name):
             return jsonify({'success': False, 'error': 'Name must be lowercase letters, numbers, and underscores only'}), 400
         
@@ -14101,33 +14800,25 @@ def api_add_external_source():
         with open(CONFIG_FILE, 'w') as f:
             f.writelines(new_lines)
         
+        # Auto-create firewall rule for UDP (unicast / multicast) sources
+        udp_port = udp_listen_port(source_url)
+        fw_warning = set_udp_firewall(udp_port, allow=True)
+
         # Save to metadata
         sources_metadata[name] = {
             'source_url': source_url,
             'on_demand': on_demand,
             'enabled': True,
             'klv': klv,
+            'firewall_opened': bool(udp_port) and not fw_warning,
         }
         save_external_sources_metadata(sources_metadata)
-        
-        # Auto-create UFW rule for UDP sources
-        if source_url.startswith('udp+mpegts://'):
-            try:
-                import re
-                port_match = re.search(r':(\d+)', source_url.replace('udp+mpegts://', ''))
-                if port_match:
-                    udp_port = port_match.group(1)
-                    subprocess.run(['sudo', 'ufw', 'allow', f'{udp_port}/udp'], 
-                                   capture_output=True, timeout=10)
-                    print(f"✓ UFW rule created: allow {udp_port}/udp", flush=True)
-            except Exception as e:
-                print(f"Warning: Could not create UFW rule: {e}", flush=True)
-        
+
         # Restart MediaMTX
         mtx_restart_checked()
         time.sleep(3)
-        
-        return jsonify({'success': True})
+
+        return jsonify({'success': True, 'warning': fw_warning})
     except Exception as e:
         print(f"ERROR adding external source: {e}", flush=True)
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -14143,15 +14834,15 @@ def api_delete_external_source():
         if not name:
             return jsonify({'success': False, 'error': 'Source name is required'}), 400
         
-        # Check it exists in metadata
-        sources_metadata = load_external_sources_metadata()
+        # Check it exists in metadata (or as a hand-written pulled path in the yml)
+        sources_metadata = load_external_sources_for(name)
         if name not in sources_metadata:
             return jsonify({'success': False, 'error': f'External source "{name}" not found'}), 404
-        
+
         # Create backup
         backup_file = os.path.join(BACKUP_DIR, f'mediamtx.yml.{datetime.now().strftime("%Y%m%d_%H%M%S")}')
         subprocess.run(['cp', CONFIG_FILE, backup_file], check=True)
-        
+
         # Remove the path entry from YAML
         # Read lines and find the path block to remove
         with open(CONFIG_FILE, 'r') as f:
@@ -14199,23 +14890,15 @@ def api_delete_external_source():
         with open(CONFIG_FILE, 'w') as f:
             f.writelines(new_lines)
         
-        # Remove UFW rule for UDP sources
-        source_url = sources_metadata[name].get('source_url', '')
-        if source_url.startswith('udp+mpegts://'):
-            try:
-                import re
-                port_match = re.search(r':(\d+)', source_url.replace('udp+mpegts://', ''))
-                if port_match:
-                    udp_port = port_match.group(1)
-                    subprocess.run(['sudo', 'ufw', 'delete', 'allow', f'{udp_port}/udp'],
-                                   capture_output=True, timeout=10)
-                    print(f"✓ UFW rule removed: {udp_port}/udp", flush=True)
-            except Exception as e:
-                print(f"Warning: Could not remove UFW rule: {e}", flush=True)
-        
         # Remove from metadata
-        del sources_metadata[name]
+        old_meta = sources_metadata.pop(name)
         save_external_sources_metadata(sources_metadata)
+
+        # Remove the firewall rule the editor opened for a UDP source, unless another
+        # source still uses the port
+        udp_port = udp_listen_port(old_meta.get('source_url', ''))
+        if udp_port and closes_own_firewall_rule(old_meta) and not udp_port_in_use(udp_port):
+            set_udp_firewall(udp_port, allow=False)
         
         # Restart MediaMTX
         mtx_restart_checked()
@@ -14237,10 +14920,10 @@ def api_toggle_external_source():
         if not name:
             return jsonify({'success': False, 'error': 'Source name is required'}), 400
         
-        sources_metadata = load_external_sources_metadata()
+        sources_metadata = load_external_sources_for(name)
         if name not in sources_metadata:
             return jsonify({'success': False, 'error': f'External source "{name}" not found'}), 404
-        
+
         currently_enabled = sources_metadata[name].get('enabled', True)
         
         # Create backup
@@ -14349,10 +15032,10 @@ def api_switch_srt_mode():
         if not name:
             return jsonify({'success': False, 'error': 'Source name is required'}), 400
         
-        sources_metadata = load_external_sources_metadata()
+        sources_metadata = load_external_sources_for(name)
         if name not in sources_metadata:
             return jsonify({'success': False, 'error': f'External source "{name}" not found'}), 404
-        
+
         source_url = sources_metadata[name].get('source_url', '')
         if not source_url.startswith('srt://'):
             return jsonify({'success': False, 'error': 'Mode switching is only available for SRT sources'}), 400
@@ -14408,73 +15091,91 @@ def api_edit_external_source():
 
         if not name or not new_source_url:
             return jsonify({'success': False, 'error': 'Name and source URL are required'}), 400
-        
-        sources_metadata = load_external_sources_metadata()
+
+        url_err = validate_source_url(new_source_url)
+        if url_err:
+            return jsonify({'success': False, 'error': url_err}), 400
+
+        sources_metadata = load_external_sources_for(name)
         if name not in sources_metadata:
             return jsonify({'success': False, 'error': f'External source "{name}" not found'}), 404
-        
+
         old_source_url = sources_metadata[name].get('source_url', '')
         is_enabled = sources_metadata[name].get('enabled', True)
-        
+
         # Create backup
         backup_file = os.path.join(BACKUP_DIR, f'mediamtx.yml.{datetime.now().strftime("%Y%m%d_%H%M%S")}')
         subprocess.run(['cp', CONFIG_FILE, backup_file], check=True)
-        
+
         # Update YAML if source is enabled
         if is_enabled:
             # Read the YAML and replace the source line for this path
             with open(CONFIG_FILE, 'r') as f:
                 lines = f.readlines()
-            
+
             new_lines = []
             in_our_path = False
+            dropped_klv = False
             on_demand_value = 'yes' if on_demand else 'no'
-            
+
             for i, line in enumerate(lines):
-                import re
                 # Detect our path entry
                 if re.match(r'^  ' + re.escape(name) + r':\s*$', line):
                     in_our_path = True
                     new_lines.append(line)
                     continue
-                
+
                 if in_our_path:
                     stripped = line.strip()
-                    # Replace source line
+                    # Replace source line, then (re)write rtspTransport, sourceOnDemand and
+                    # KLV runOn lines after it (hand-written paths may lack sourceOnDemand)
                     if stripped.startswith('source:'):
                         new_lines.append(f'    source: {new_source_url}\n')
                         new_lines.append(rtsp_transport_line(new_source_url))  # '' for non-RTSP
-                        continue
-                    # Replace sourceOnDemand line, then (re)write KLV runOn lines after it
-                    elif stripped.startswith('sourceOnDemand:'):
                         new_lines.append(f'    sourceOnDemand: {on_demand_value}\n')
                         new_lines.append(klv_runon_lines(klv))  # '' clears it when disabled
                         continue
-                    # Drop any existing KLV runOn / rtspTransport lines — rewritten above
-                    elif (stripped.startswith('runOnReady:') or stripped.startswith('runOnReadyRestart:')
-                          or stripped.startswith('runOnNotReady:') or stripped.startswith('rtspTransport:')):
+                    # Drop the old sourceOnDemand / rtspTransport lines — rewritten above
+                    elif stripped.startswith('sourceOnDemand:') or stripped.startswith('rtspTransport:'):
+                        continue
+                    # Drop the old KLV runOn lines; keep any runOn hooks the operator wrote by hand
+                    elif (stripped.startswith('runOnReady:') or stripped.startswith('runOnNotReady:')) and KLV_SIDECAR in stripped:
+                        dropped_klv = True
+                        continue
+                    elif stripped.startswith('runOnReadyRestart:') and dropped_klv:
                         continue
                     # Detect end of our path block
                     elif stripped and not line.startswith('    ') and not line.startswith('\t\t'):
                         in_our_path = False
-                
+
                 new_lines.append(line)
-            
+
             with open(CONFIG_FILE, 'w') as f:
                 f.writelines(new_lines)
-        
+
+        # Move the firewall rule when a UDP source changes port
+        old_port, new_port = udp_listen_port(old_source_url), udp_listen_port(new_source_url)
+        closes_old = closes_own_firewall_rule(sources_metadata[name])
+        fw_warning = ''
+        if old_port != new_port:
+            fw_warning = set_udp_firewall(new_port, allow=True)
+            sources_metadata[name]['firewall_opened'] = bool(new_port) and not fw_warning
+
         # Update metadata
         sources_metadata[name]['source_url'] = new_source_url
         sources_metadata[name]['on_demand'] = on_demand
         sources_metadata[name]['klv'] = klv
         save_external_sources_metadata(sources_metadata)
-        
+
+        if old_port and old_port != new_port and closes_old and not udp_port_in_use(old_port):
+            set_udp_firewall(old_port, allow=False)
+
         # Restart MediaMTX if enabled
         if is_enabled:
             mtx_restart_checked()
             time.sleep(3)
         
-        return jsonify({'success': True})
+        return jsonify({'success': True, 'warning': fw_warning})
     except Exception as e:
         print(f"ERROR editing external source: {e}", flush=True)
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -14694,7 +15395,7 @@ pc.ontrack=function(ev){{dbg("ontrack kind="+ev.track.kind+" streams="+((ev.stre
 if(ev.streams&&ev.streams[0]){{if(video.srcObject!==ev.streams[0])video.srcObject=ev.streams[0];}}else{{ms.addTrack(ev.track);if(video.srcObject!==ms)video.srcObject=ms;}}err.style.display="none";
 video.play().then(function(){{dbg("play() ok");}}).catch(function(e){{dbg("play() BLOCKED: "+(e.name||e)+" - tap the video");}});}};
 pc.onconnectionstatechange=function(){{if(pc&&(pc.connectionState==="failed"||pc.connectionState==="closed"))fail("connection "+pc.connectionState);}};
-setTimeout(function(){{if(done)return;if(!video.videoWidth)fail("no video within 6s");else done=true;}},6000);
+setTimeout(function(){{if(done)return;if(!video.videoWidth)fail("no video within 12s");else done=true;}},12000);
 pc.createOffer().then(function(o){{return pc.setLocalDescription(o).then(function(){{return o;}});}})
 .then(function(o){{return fetch(whep,{{method:"POST",headers:{{"Content-Type":"application/sdp"}},body:o.sdp}});}})
 .then(function(r){{if(!r.ok)throw new Error("WHEP HTTP "+r.status);return r.text();}})
@@ -14717,6 +15418,11 @@ def shared_hls_proxy(token, subpath):
         return 'Link expired', 403
     if not subpath.startswith(info['stream']):
         return 'Forbidden', 403
+    # Serve from the '<stream>_hls' re-encode sidecar when one exists -- a raw
+    # keyframe-less path never produces a manifest, so this route would 502.
+    sidecar = _hls_sidecar_path(info['stream'])
+    if sidecar != info['stream']:
+        subpath = sidecar + subpath[len(info['stream']):]
     try:
         data, ct = hls_fetch_for_share(subpath, request.query_string)
         r = Response(data, content_type=ct)
@@ -14754,14 +15460,34 @@ def api_share_mode_set():
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
 
+def _hls_sidecar_path(stream):
+    """If '<stream>_hls' is a configured MediaMTX path, return that, else
+    return stream unchanged. Keyframe-less sources (eBee: one IDR at broadcast
+    start then an infinite GOP) can't be HLS/WebRTC-muxed directly; mediamtx.yml
+    re-encodes them into a '<path>_hls' runOnDemand sidecar. Central so
+    /hls-proxy (overlay), /shared-hls and WHEP all agree on the swap."""
+    if not stream or stream.endswith('_hls'):
+        return stream
+    try:
+        import urllib.request
+        with urllib.request.urlopen(
+                f'http://127.0.0.1:9898/v3/config/paths/get/{stream}_hls', timeout=3) as r:
+            if r.status == 200:
+                return stream + '_hls'
+    except Exception:
+        pass
+    return stream
+
+
 def whep_negotiate(stream, sdp_offer):
     """Forward an SDP offer to MediaMTX's WHEP endpoint, return (answer, error).
 
     Signalling is proxied for the same reason HLS is: MediaMTX has no notion of
     our share tokens, so the only way to enforce them is to be the one thing
-    that can reach it. Pair this with webrtcAddress bound to 127.0.0.1 -- if
-    :8889 stays publicly reachable, anyone who knows a stream name can
-    negotiate directly and the token check is decorative.
+    that can reach it. Pair this with the webrtcAddress port (:8887) published
+    only on 127.0.0.1 in docker-compose.yml -- if it stays publicly reachable,
+    anyone who knows a stream name can negotiate directly and the token check
+    is decorative.
 
     Media itself still flows MediaMTX:8189 -> browser and never passes through
     here, which is fine: no media is sent without a negotiated session, and a
@@ -14771,11 +15497,13 @@ def whep_negotiate(stream, sdp_offer):
     import urllib.error
     import urllib.request
 
-    if not re.match(r'^[A-Za-z0-9_.-]+$', stream or ''):
+    # Nested paths (live/drone1) are valid: MediaMTX serves WHEP at /live/drone1/whep.
+    if not is_valid_stream_name(stream):
         return None, 'Invalid stream name'
+    stream = _hls_sidecar_path(stream)  # keyframe-bearing re-encode sidecar, if configured
     try:
         enc = str(read_yaml_field('webrtcEncryption', 'no')).lower() in ('yes', 'true')
-        port = str(read_yaml_field('webrtcAddress', ':8889')).split(':')[-1] or '8889'
+        port = str(read_yaml_field('webrtcAddress', ':8887')).split(':')[-1] or '8887'
         url = f"{'https' if enc else 'http'}://127.0.0.1:{port}/{stream}/whep"
         # Self-signed / hostname-mismatched certs are expected on the loopback hop.
         ctx = ssl.create_default_context()
@@ -14800,10 +15528,12 @@ def whep_negotiate(stream, sdp_offer):
         return None, str(e)[:200]
 
 
-@app.route('/whep/<stream_name>', methods=['POST'])
+@app.route('/whep/<path:stream_name>', methods=['POST'])
 @login_required
 def whep_authenticated(stream_name):
-    """WHEP for logged-in console users (Active Streams watch button)."""
+    """WHEP for logged-in console users (Active Streams watch button).
+    `path:` so nested stream paths such as live/drone1 reach MediaMTX;
+    whep_negotiate() checks the name."""
     answer, err = whep_negotiate(stream_name, request.get_data(as_text=True))
     if err:
         return Response(err, status=502, content_type='text/plain')
@@ -14940,6 +15670,10 @@ def api_share_links_revoke():
 
 def _watch_stream_impl(stream_name):
     """Shareable HLS player page - credentials embedded server-side"""
+    # The name is written into the page's HTML and JS below, and the route takes
+    # nested paths (live/drone1), so allow only stream-path characters.
+    if not is_valid_stream_name(stream_name):
+        return "Stream not found", 404
     try:
         # Get HLS viewer credentials
         cred = get_hlsviewer_credential()
@@ -15090,7 +15824,7 @@ def _watch_stream_impl(stream_name):
 # The overlay provides its own visibility-aware /watch/ route; registering both
 # crashes Flask with "View function mapping is overwriting an existing endpoint".
 if not LDAP_OVERLAY_ACTIVE:
-    watch_stream = app.route('/watch/<stream_name>', endpoint='watch_stream')(_watch_stream_impl)
+    watch_stream = app.route('/watch/<path:stream_name>', endpoint='watch_stream')(_watch_stream_impl)
 
 # === END SHAREABLE WATCH LINKS ===
 
@@ -15120,6 +15854,8 @@ def get_dashboard_metrics():
                 streams_list = []
                 
                 if 'items' in paths_data:
+                    all_path_names = {p.get('name', '') for p in paths_data['items']}
+
                     # Build a map of live/ paths (subtract 1 for internal FFmpeg)
                     live_paths = {}
                     for path in paths_data['items']:
@@ -15135,10 +15871,22 @@ def get_dashboard_metrics():
                                 live_paths[stream_name] = max(0, (readers_data or 0) - 1)
                     
                     # Process main paths and add live/ viewers
+                    all_names = {p.get('name', '') for p in paths_data['items']}
+                    # '<stream>_hls' re-encode sidecars: real viewers connect to the sidecar; the
+                    # base path's only reader is the internal re-encode ffmpeg. Count the sidecar's
+                    # readers as the base stream's viewers and skip the sidecar as its own stream.
+                    sidecar_readers = {}
+                    for path in paths_data['items']:
+                        n = path.get('name', '')
+                        if n.endswith('_hls') and n[:-4] in all_names:
+                            rd = path.get('readers', [])
+                            sidecar_readers[n[:-4]] = len(rd) if isinstance(rd, list) else (rd or 0)
+
                     for path in paths_data['items']:
                         path_name = path.get('name', '')
-                        # Skip internal paths and live/ paths
-                        if path_name and path_name != 'all' and not path_name.startswith('live/'):
+                        # Skip internal paths, legacy relay inputs and *_hls sidecars
+                        if path_name and path_name != 'all' and not is_legacy_relay_input(path_name, all_names) \
+                                and not (path_name.endswith('_hls') and path_name[:-4] in all_names):
                             # Count streams that are ready (have active source)
                             if path.get('ready', False):
                                 active_streams += 1
@@ -15152,6 +15900,8 @@ def get_dashboard_metrics():
                                 # Add live/ viewers (minus FFmpeg)
                                 if path_name in live_paths:
                                     readers += live_paths[path_name]
+                                if path_name in sidecar_readers:
+                                    readers = sidecar_readers[path_name]
                                 
                                 total_viewers += readers
                                 
@@ -15293,6 +16043,7 @@ if __name__ == '__main__':
             content = f.read()
         if "ips: ['127.0.0.1']" in content and "::1" not in content:
             content = content.replace("ips: ['127.0.0.1']", "ips: ['127.0.0.1', '::1']", 1)
+            backup_config_file('the IPv6 loopback auto-patch')
             with open(CONFIG_FILE, 'w') as f:
                 f.write(content)
             print("✓ Patched mediamtx.yml: Added IPv6 loopback (::1) to localhost API user")
@@ -15348,6 +16099,7 @@ if __name__ == '__main__':
         lines = cleaned
 
         if changed:
+            backup_config_file('removing the legacy FFmpeg live/ path')
             with open(CONFIG_FILE, 'w') as f:
                 f.writelines(lines)
             print("✓ Removed legacy FFmpeg ~^live/(.+)$ path from mediamtx.yml (no longer needed with MPEG-TS demuxing)")
@@ -15365,6 +16117,7 @@ if __name__ == '__main__':
                 content = content.replace('pathDefaults:', 'pathDefaults:\n  rtspDemuxMpegts: true', 1)
             elif 'paths:' in content:
                 content = content.replace('paths:', 'pathDefaults:\n  rtspDemuxMpegts: true\n\npaths:', 1)
+            backup_config_file('the rtspDemuxMpegts auto-patch')
             with open(CONFIG_FILE, 'w') as f:
                 f.write(content)
             print("✓ Added rtspDemuxMpegts: true to pathDefaults (MPEG-TS unwrapping for RTSP sources)")
