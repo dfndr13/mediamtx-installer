@@ -128,13 +128,22 @@ docker logs mediamtx -f
 # Restart
 docker compose -f /opt/mediamtx/docker-compose.yml restart
 
-# Stop
-docker compose -f /opt/mediamtx/docker-compose.yml down
+# Stop (start it again with `start`)
+docker compose -f /opt/mediamtx/docker-compose.yml stop
 
-# Update to latest MediaMTX
+# Update MediaMTX: change the image tag in docker-compose.yml first, then
 docker compose -f /opt/mediamtx/docker-compose.yml pull
 docker compose -f /opt/mediamtx/docker-compose.yml up -d
 ```
+
+**Pin the MediaMTX version.** The installer writes `image: bluenviron/mediamtx:latest-ffmpeg`. After installing, change it to an exact release tag (for example `bluenviron/mediamtx:1.21.2-ffmpeg`), so a routine `pull` or container recreate can't silently upgrade you. To update, read the release notes for deprecated or renamed settings, change the tag, then run the commands above. Before updating, tag the current image so you can roll back: `docker tag bluenviron/mediamtx:<old>-ffmpeg bluenviron/mediamtx:rollback-<old>-ffmpeg`.
+
+### Editing mediamtx.yml on the host
+
+`mediamtx.yml` is bind-mounted into the container as a single file, which has two consequences:
+
+- **Edit it in place.** Tools that write a new file and rename it over the old one (`sed -i`, many editors' "safe save") give the file a new inode, and the container keeps reading the old, deleted one. Neither your edit nor later web editor saves reach MediaMTX until the container restarts. Edit with something that writes into the existing file (for example `cp new.yml /opt/mediamtx/config/mediamtx.yml`). To check, run `docker exec mediamtx stat -c %h /mediamtx.yml`: it should print `1`, and `0` means the container is on a deleted copy.
+- **Restart after editing.** MediaMTX doesn't pick up host-side edits on its own. Run `docker restart mediamtx` afterwards. The web editor does this itself after saving.
 
 ---
 
@@ -476,7 +485,7 @@ WantedBy=multi-user.target
 | `MEDIAMTX_HLS_SECRET` | The Bearer secret `/hls-proxy` sends to MediaMTX. It must equal `hlsCDNSecret` in `mediamtx.yml`. See [HLS secret](#hls-secret). |
 | `MEDIAMTX_CONFIG` | Path to `mediamtx.yml`. The editor reads and writes the config there (wrapper step 1), and the overlay reads the `hlsviewer` password from it. |
 | `PORT` | The port the editor listens on, on `127.0.0.1` only (wrapper step 3, default `5100`). Caddy proxies to it. |
-| `MEDIAMTX_API_URL` | The MediaMTX control API the overlay uses to list streams. **Don't put credentials in it** (no `user:pass@`). That once caused a DNS failure for viewer users. MediaMTX's `authInternalUsers` lets the API through without a password from the host instead. |
+| `MEDIAMTX_API_URL` | The MediaMTX control API the overlay uses to list streams. **Don't put credentials in it** (no `user:pass@`). That once caused a DNS failure for viewer users. MediaMTX's `authInternalUsers` lets the API through without a password from the host instead; limit that user's `ips` as described under [Password-free API access](#password-free-api-access). |
 | `WEBEDITOR_PORT` | Not read by anything. `PORT` is the one that counts. |
 | `BACKUP_DIR` | Not set here. Config backups go to `/opt/mediamtx/backups`, the wrapper's default (step 2). |
 
@@ -643,6 +652,34 @@ RTSP sources that wrap H264/AAC inside MPEG-TS (TAKICU, ATAK UAS Tool, ISR camer
 ### API Port — Always Loopback Only
 
 The MediaMTX control API is mapped to `127.0.0.1:9898` on the host in all Docker deployments. It is never reachable from the internet. Only Caddy should bind on `0.0.0.0`.
+
+### Password-free API access
+
+Loopback publishing keeps the API off the internet, but other containers on the same Docker network can still reach it. Anyone who can use the API can change the configuration, including `runOnDemand`/`runOnReady` commands that MediaMTX runs as shell commands, so treat API access like shell access.
+
+If you give the password-free `any` user the `api` action (the overlay does this so that `MEDIAMTX_API_URL` needs no credentials), always restrict it with `ips`:
+
+```yaml
+authInternalUsers:
+- user: any
+  pass: ''
+  ips: ['127.0.0.1', '::1', '<docker-bridge-gateway>']
+  permissions:
+  - action: api
+```
+
+Requests from the host to a published port reach the container from the Docker bridge gateway, not from `127.0.0.1`, so add that gateway address (`docker network inspect <network> --format '{{(index .IPAM.Config 0).Gateway}}'`). With `ips: []`, any container that can reach the API gets full control. Afterwards, check that a call from another container gets `401`. Remove any API user you don't use, especially password users with an empty `ips` list: they work from anywhere the port is reachable.
+
+### WebRTC: advertise only public addresses
+
+By default (`webrtcIPsFromInterfaces: yes`), MediaMTX lists every interface address in its WebRTC answers. Inside Docker that means container and bridge addresses, which remote viewers can't use and which reveal your internal network layout. List only the addresses viewers should use instead:
+
+```yaml
+webrtcIPsFromInterfaces: no
+webrtcAdditionalHosts: ['video.example.com', '<public-ip>']
+```
+
+Restart the container, then check that WebRTC playback still works from outside your network (on a phone with Wi-Fi off, for example).
 
 ### Credentials (Docker install)
 - The installer prompts for custom usernames and passwords at install time
