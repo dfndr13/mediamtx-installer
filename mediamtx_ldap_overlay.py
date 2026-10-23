@@ -283,9 +283,14 @@ def apply_ldap_overlay(app):
                     return Response(WATCH_PRIVATE_HTML, content_type='text/html', status=403)
             else:
                 return Response(WATCH_PRIVATE_HTML, content_type='text/html', status=403)
-        hls_url = f'/hls-proxy/{stream_name}/index.m3u8'
-        title = f'{stream_name} - Live'
-        html = f'''<!DOCTYPE html>
+        return Response(_player_html(stream_name, f'/hls-proxy/{stream_name}/index.m3u8'), content_type='text/html')
+
+    def _player_html(stream_name, hls_url):
+        """HLS player page shared by /watch/ (login) and /view/ (no login)."""
+        title = html_escape(f'{stream_name} - Live')
+        # '<' escaped too, or a '</script>' in the stream name would end the script block
+        url_js = json.dumps(hls_url).replace('<', '\\u003c')
+        return f'''<!DOCTYPE html>
 <html><head><title>{title}</title>
 <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
 <style>*{{margin:0;padding:0}}body{{background:#000;overflow:hidden;font-family:sans-serif}}
@@ -297,7 +302,7 @@ z-index:100;justify-content:center;align-items:center;flex-direction:column;text
 <video id="v" controls autoplay muted playsinline></video>
 <div id="err"><h2>Stream Offline</h2><p>Waiting for stream\u2026 auto-reconnecting.</p></div>
 <script>
-var video=document.getElementById("v"),err=document.getElementById("err"),url="{hls_url}";
+var video=document.getElementById("v"),err=document.getElementById("err"),url={url_js};
 function start(){{
 if(Hls.isSupported()){{var hls=new Hls({{enableWorker:true,lowLatencyMode:false,maxBufferLength:30,maxMaxBufferLength:60,liveSyncDurationCount:4,liveMaxLatencyDurationCount:7}});
 hls.loadSource(url);hls.attachMedia(video);
@@ -307,7 +312,40 @@ hls.on(Hls.Events.ERROR,function(ev,data){{if(data.fatal){{err.style.display="fl
 }}
 start();
 </script></body></html>'''
-        return Response(html, content_type='text/html')
+
+    # ── Open browser links (no login): https://video.<domain>/view/<path> ──
+    # The pilot's Pilot 2 address rtmp://video.<domain>/<path> becomes /view/<path>.
+    # Public streams only; once an agency admin marks a stream private this link stops
+    # working and it takes a login or a share link. Caddy skips forward_auth for these.
+
+    _VIEW_FILE_EXT = ('.m3u8', '.mp4', '.m4s', '.ts', '.m4v', '.m4a')
+
+    def _view_allowed(stream):
+        parts = stream.split('/')
+        if not stream or any(p in ('', '.', '..') for p in parts):
+            return False
+        return _load_visibility().get(stream, 'public') != 'private'
+
+    @app.route('/view/<path:stream_name>')
+    def view_stream_public(stream_name):
+        stream_name = stream_name.rstrip('/')
+        if not _view_allowed(stream_name):
+            return Response(WATCH_PRIVATE_HTML, content_type='text/html', status=403)
+        return Response(_player_html(stream_name, f'/view-hls/{stream_name}/index.m3u8'), content_type='text/html')
+
+    @app.route('/view-hls/<path:subpath>')
+    def view_hls_public(subpath):
+        # MediaMTX HLS URLs are <path>/<file>; the stream is everything before the file
+        stream, _, fname = subpath.rpartition('/')
+        if not fname.endswith(_VIEW_FILE_EXT) or not _view_allowed(stream):
+            return 'Unauthorized', 403
+        try:
+            data, ct = _hls_fetch(subpath)
+            r = Response(data, content_type=ct)
+            r.headers['Cache-Control'] = 'no-cache'
+            return r
+        except Exception as e:
+            return str(e)[:200], 502
 
     # Share links (/shared/<token>, /shared-hls/, /api/share-links*) are provided by core; overlay only allows paths for viewers.
 
