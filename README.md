@@ -84,6 +84,8 @@ The Docker installer detects CloudTAK automatically and offers **coexistence mod
 
 > **Note:** The API is always mapped to host port `9898` (remapped from container-internal `9997`). This is compatible with infra-TAK's MediaMTX web editor, which expects the API on port `9898`.
 
+> **Keep HLS on loopback.** Publish HLS as `127.0.0.1:8980:8888`, not `8980:8888`. Browsers never need MediaMTX's own HLS port: the web editor serves HLS at `/hls-proxy/` (logged-in users), `/shared-hls/` (share links) and `/view-hls/` (open links), and adds the HLS secret itself. Docker's port publishing bypasses ufw, so any port published on `0.0.0.0` is reachable from the internet whatever ufw says.
+
 ### Security: API Port is Always Loopback-Only
 
 The MediaMTX control API (`9997` inside the container) is **always mapped to `127.0.0.1` on the host** — never to `0.0.0.0`. This means it is only reachable by processes on the server itself, never from the internet.
@@ -203,7 +205,7 @@ sudo systemctl status mediamtx-webeditor
 sudo journalctl -u mediamtx-webeditor -n 80 --no-pager | grep -E '\[wrapper\]|ok -|FATAL'
 ```
 
-- **`FATAL - ... matches neither the known original nor the patched version`:** the editor or overlay file changed (a self-update from the Versions tab, a `git pull`, or a hand edit) and no longer matches the patch snapshots. Review the change, update the snapshots (see [CloudTAK patch-snapshot dependency](#cloudtak-patch-snapshot-dependency-step-7)) and restart.
+- **`FATAL - ... matches neither the known original nor the patched version`:** the editor or overlay file changed (a self-update from the Versions tab, a `git pull`, or a hand edit) and no longer matches the patch snapshots. Review the change, update the snapshots (see [Patch snapshots](#patch-snapshots-step-7)) and restart.
 - **`[wrapper] Patches applied. Starting web editor...` followed by a Python traceback:** the wrapper finished and the editor itself failed. Read the traceback.
 - **No `[wrapper]` lines at all:** the unit isn't running the wrapper, for example after infra-TAK's Deploy rewrote it. See the warning above.
 
@@ -215,11 +217,29 @@ sudo journalctl -u mediamtx-webeditor -n 80 --no-pager | grep -E '\[wrapper\]|ok
 If it has already been pressed, restore both files from the snapshots and restart:
 
 ```bash
-P=/home/takadmin/CloudTAK/mediamtx-webeditor-patches   # your patch directory
-sudo cp "$P/mediamtx_config_editor.py.patched" /opt/mediamtx-webeditor/mediamtx_config_editor.py
-sudo cp "$P/mediamtx_ldap_overlay.py.patched"  /opt/mediamtx-webeditor/mediamtx_ldap_overlay.py
+P=/opt/mediamtx-webeditor/patches   # the patch snapshots (see step 7)
+W=/opt/mediamtx-webeditor
+sudo chattr -i $W/mediamtx_config_editor.py $W/mediamtx_ldap_overlay.py   # if write-protected
+sudo cp "$P/mediamtx_config_editor.py.patched" $W/mediamtx_config_editor.py
+sudo cp "$P/mediamtx_ldap_overlay.py.patched"  $W/mediamtx_ldap_overlay.py
 sudo systemctl restart mediamtx-webeditor
+sudo chattr +i $W/mediamtx_config_editor.py $W/mediamtx_ldap_overlay.py
 ```
+
+**infra-TAK's Deploy MediaMTX button: don't use it on Docker deployments either.** It installs a bare-metal MediaMTX: a native binary, a new `mediamtx.service` that runs it (and then fights the container for the same ports), a new `/usr/local/etc/mediamtx.yml`, a new web editor unit (no wrapper, port `5080`, no HLS secret) and infra-TAK's overlay, and it changes ufw rules.
+
+### Write-protecting the editor
+
+To stop either button, or the editor's own **Versions → Update**, from replacing your files, make them immutable:
+
+```bash
+sudo chattr +i /opt/mediamtx-webeditor/mediamtx_config_editor.py /opt/mediamtx-webeditor/mediamtx_ldap_overlay.py \
+               /etc/systemd/system/mediamtx-webeditor.service /etc/systemd/system/mediamtx.service
+```
+
+- The wrapper still starts normally: its sed steps run on a copy and only write the editor back if something changed (see [Wrapper script](#wrapper-script-start_webeditorsh)).
+- Any change you do want needs `sudo chattr -i` first and `sudo chattr +i` after, plus matching snapshot updates.
+- Self-updates from the Versions tab stop working, so editor updates become manual: diff the new upstream file against the installed one, re-apply your patches, refresh both snapshots, test, then re-protect.
 
 ### After any editor update, check
 
@@ -242,6 +262,9 @@ The LDAP overlay (`mediamtx_ldap_overlay.py`) patches the MediaMTX web editor to
 - **Agency-scoped stream filtering** - users see the streams of the agency in their `agency_abbreviation` attribute
 - **Agency admin page** (`/agency-admin`) - lists the agency's streams, with Watch, Share, Stop and a public/private toggle for each
 - **Stream Access page** (`/stream-access`) - vid_admin manages users' viewer groups in Authentik
+- **No-access page** - logged-in users without a `vid_*` group (or non-admins without an agency) get a page telling them to contact their agency administrator
+- **Share links** - no-login token links that expire, with agency and private-stream checks; agency admins can list and revoke their agency's links
+- **Open browser links** (`/view/<path>`) - no-login playback of *public* streams, for links sent out from a drone app
 
 ### The four groups
 
@@ -249,10 +272,13 @@ The LDAP overlay (`mediamtx_ldap_overlay.py`) patches the MediaMTX web editor to
 |-------|------|----------|------|--------------|
 | `vid_admin` (or `authentik Admins`) | admin | `/` (full editor) | Every agency's streams | Full config editor, Stream Access page, watch any stream, set visibility on any stream (API only, see below) |
 | `vid_agency_admin` | agency admin | `/agency-admin` | Own agency's streams, public and private | Watch, share, stop and set public/private visibility on own agency's streams |
-| `vid_private` | viewer | `/viewer` | Own agency's public and private streams | Watch, share |
-| `vid_public` | viewer | `/viewer` | Own agency's public streams only | Watch, share |
+| `vid_private` | viewer | `/viewer` | Own agency's public and private streams | Watch, share (including private streams) |
+| `vid_public` | viewer | `/viewer` | Own agency's public streams only | Watch, share public streams |
+| none of the above | - | No-access page | Nothing | - |
 
 If a user is in more than one group, the highest role wins: admin, then agency admin, then viewer. For example, a member of both `vid_agency_admin` and `vid_private` is an agency admin.
+
+Give each viewer **one** of `vid_public` or `vid_private`: `vid_private` already includes everything `vid_public` sees. There is one private tier per agency, so keep `vid_private` to the people who need sensitive feeds and use share links for anyone else.
 
 ### Access Control Model
 
@@ -294,8 +320,8 @@ An agency admin marks each of their own streams public or private, so the decisi
 1. A user opens `https://video.<your-domain>/`. Caddy's `forward_auth` sends the request to the Authentik outpost (`/outpost.goauthentik.io/auth/caddy`). Users who aren't logged in are sent to the Authentik login.
 2. Authentik answers with `X-Authentik-Username` and `X-Authentik-Groups`, with group names separated by `|`. Caddy copies both onto the request it proxies to the web editor on `127.0.0.1:5100`.
 3. On every request the overlay splits the groups on `|`, maps them to a role and stores the role in the session. On a user's first request, it also looks the user up in the Authentik API and caches `agency_name` and `agency_abbreviation` in the session. A change to those attributes takes effect when the user starts a new web editor session.
-4. Viewers and agency admins can reach only their own pages and APIs. Anything else redirects to `/viewer` or `/agency-admin`. Admins aren't restricted.
-5. Stream lists and playback are filtered by agency. The first part of the stream path (`MPD` in `MPD/patrol_1`) is compared with the user's `agency_abbreviation`, ignoring case. Private streams are then hidden from viewers without `vid_private`. Agency admins see their own agency's private streams.
+4. If the user is in none of the `vid_*` groups, or isn't an admin and has no `agency_abbreviation`, every page returns the no-access page (HTTP 403). Otherwise, viewers and agency admins can reach only their own pages and APIs. Anything else redirects to `/viewer` or `/agency-admin`. Admins aren't restricted.
+5. Stream lists and playback are filtered by agency. The first part of the stream path (`MPD` in `MPD/patrol_1`) is compared with the user's `agency_abbreviation`, ignoring case. Private streams are then hidden from viewers without `vid_private`. Agency admins see their own agency's private streams. A non-admin with no agency sees nothing (earlier versions skipped the filter and showed every agency's streams).
 
 ### Setup
 
@@ -305,7 +331,7 @@ An agency admin marks each of their own streams public or private, so the decisi
    agency_name: Mayberry Police Department   # example only
    agency_abbreviation: MPD
    ```
-3. Assign users to groups. Assign `vid_admin` and `vid_agency_admin` in Authentik directly. The Stream Access page only toggles `vid_private`, `vid_public` and `authentik Admins`. Its Admin toggle adds the user to `authentik Admins`, which also gives them admin rights in Authentik itself.
+3. Assign users to groups, for example per agency from your user-management tool (TAK Portal agency templates work, since the `vid_*` groups are visible there; a template saved with "overwrite groups" removes any `vid_*` group it doesn't list). Assign `vid_admin` and `vid_agency_admin` in Authentik directly. The Stream Access page only toggles `vid_private`, `vid_public` and `authentik Admins`. Its Admin toggle adds the user to `authentik Admins`, which also gives them admin rights in Authentik itself.
 4. Name streams `AGENCY/streamname` using the agency abbreviation, for example `MPD/patrol_1` (example only). Don't add a `live/` prefix, and use underscores instead of hyphens. Streams whose first path segment isn't an agency abbreviation don't show up for agency users.
 
 ### Pages
@@ -315,6 +341,26 @@ An agency admin marks each of their own streams public or private, so the decisi
 | vid_admin | `/` (full editor), `/stream-access` |
 | vid_agency_admin | `/agency-admin` |
 | vid_private / vid_public | `/viewer` |
+| anyone with a share link | `/shared/<token>` |
+| anyone, public streams only | `/view/<stream path>` |
+
+### Share links
+
+- **Share** always creates a token link that plays without a login, for public and private streams, so it works for people who have no account.
+- Viewer and agency-admin links default to 4 hours and can't exceed 24 hours. Admins create theirs through the editor's own UI.
+- Viewers and agency admins can only share their own agency's streams, and `vid_public` members can't share private streams.
+- Only admins can list every link. Agency admins see and revoke their own agency's links on `/agency-admin`.
+- `/api/viewer/hlscred` (which returned the `hlsviewer` password) is no longer allowed for viewers; block it at the proxy as well (see below).
+
+### Open browser links (`/view/`)
+
+For streams pushed from apps that only take one RTMP URL (for example DJI Pilot 2), the matching browser link is the same path under `/view/`:
+
+```
+rtmp://video.<your-domain>/MPD/patrol_1   ->   https://video.<your-domain>/view/MPD/patrol_1
+```
+
+(`MPD` = Mayberry Police Department, example only.) It plays without a login, but only while the stream is **public**: marking it private turns the link off. `/view-hls/` serves only HLS playlists and media segments, and rejects `.`/`..` path tricks.
 
 ### Caddy + Authentik wiring
 
@@ -327,9 +373,25 @@ video.<your-domain> {
         @video_logout path /logout
         redir @video_logout /outpost.goauthentik.io/sign_out?rd=https%3A%2F%2Fvideo.<your-domain>%2F 302
 
+        # Never hand out the hlsviewer password
+        respond /api/viewer/hlscred 404
+
+        # Open links for public streams skip Authentik; the web editor refuses private ones.
+        # Strip client-sent X-Authentik-* headers: the web editor trusts them.
+        @view path /view/* /view-hls/*
+        handle @view {
+            request_header -X-Authentik-Username
+            request_header -X-Authentik-Groups
+            request_header -X-Authentik-Email
+            reverse_proxy http://127.0.0.1:5100
+        }
+
         # Share links carry their own token, so they skip Authentik
         @shared path /shared/* /shared-hls/*
         handle @shared {
+            request_header -X-Authentik-Username
+            request_header -X-Authentik-Groups
+            request_header -X-Authentik-Email
             reverse_proxy http://127.0.0.1:5100
         }
 
@@ -345,8 +407,9 @@ video.<your-domain> {
 }
 ```
 
-- `forward_auth` guards everything except the outpost endpoints, the logout redirect and share links. Share links (`/shared/*`, `/shared-hls/*`) skip Authentik on purpose, because the web editor checks each link's own token.
-- The web editor trusts the `X-Authentik-*` headers it receives, so port `5100` must be reachable only through Caddy. Keep it closed in the firewall.
+- `forward_auth` guards everything except the outpost endpoints, the logout redirect, share links and open links. Share links (`/shared/*`, `/shared-hls/*`) skip Authentik because the web editor checks each link's token; open links (`/view/*`, `/view-hls/*`) skip it because the web editor serves only public streams there.
+- The web editor trusts the `X-Authentik-*` headers it receives, so port `5100` must be reachable only through Caddy. The wrapper binds it to `127.0.0.1` (step 3), and the routes that skip `forward_auth` strip those headers.
+- Don't route anything else straight to MediaMTX. In particular, no `/live/*`-style route that adds the HLS secret: that serves every stream to anyone, with no login and no agency check.
 - ⚠️ **`/hls-proxy/*` must never be publicly exposed.** It's a web editor route that fetches HLS from MediaMTX on the user's behalf, using the server's HLS secret. Never add a Caddy route that lets it bypass `forward_auth`.
 
 #### HLS secret
@@ -360,13 +423,14 @@ The secret is set in both of these places, and they must match:
 | `/opt/mediamtx/config/mediamtx.yml` | `hlsCDNSecret: <hls-secret>` |
 | web editor systemd unit | `Environment=MEDIAMTX_HLS_SECRET=<hls-secret>` |
 
-The same secret must also be set in the reverse proxy config that forwards HLS to MediaMTX.
+Nothing else needs it. Don't add a reverse-proxy route that forwards HLS to MediaMTX with this secret: it would bypass the login and agency checks.
 
 Generate one with `openssl rand -hex 32`. If the two don't match, or the variable is missing, playback through `/watch` fails. Share links keep working, because they use the `hlsviewer` account instead.
 
 ### Known issues
 
 - **vid_admin has no visibility control in the UI.** Use the API or edit `stream_visibility.json`, as described above.
+- **Open `/view/` links work for anyone who knows the stream path** while the stream is public. Mark sensitive streams private, and send share links rather than `/view/` links when the audience should be limited.
 - **Agency abbreviations aren't guaranteed to be unique.** `agency_name` is the unique key, but filtering uses `agency_abbreviation`, so two agencies that share an abbreviation see each other's streams.
 
 ---
@@ -411,7 +475,7 @@ WantedBy=multi-user.target
 | `AUTHENTIK_TOKEN` | Authentik API token. See [Authentik token permissions](#authentik-token-permissions). |
 | `MEDIAMTX_HLS_SECRET` | The Bearer secret `/hls-proxy` sends to MediaMTX. It must equal `hlsCDNSecret` in `mediamtx.yml`. See [HLS secret](#hls-secret). |
 | `MEDIAMTX_CONFIG` | Path to `mediamtx.yml`. The editor reads and writes the config there (wrapper step 1), and the overlay reads the `hlsviewer` password from it. |
-| `PORT` | The port the editor listens on (wrapper step 3, default `5100`). Caddy proxies to it. |
+| `PORT` | The port the editor listens on, on `127.0.0.1` only (wrapper step 3, default `5100`). Caddy proxies to it. |
 | `MEDIAMTX_API_URL` | The MediaMTX control API the overlay uses to list streams. **Don't put credentials in it** (no `user:pass@`). That once caused a DNS failure for viewer users. MediaMTX's `authInternalUsers` lets the API through without a password from the host instead. |
 | `WEBEDITOR_PORT` | Not read by anything. `PORT` is the one that counts. |
 | `BACKUP_DIR` | Not set here. Config backups go to `/opt/mediamtx/backups`, the wrapper's default (step 2). |
@@ -442,24 +506,24 @@ The token's user therefore needs to view users and groups, change and delete use
 
 When the web editor updates itself from the Versions tab, the update overwrites the local patches and the overlay hook. systemd runs the wrapper instead of the editor, and the wrapper re-applies everything on every start, including crash restarts (`Restart=always`).
 
-What each step does:
+What each step does. Steps 1–6 run on a temporary copy of the editor, which is written back only if they changed something, so the wrapper also works when the editor is write-protected (`chattr +i`):
 
 1. Points `CONFIG_FILE` at `$MEDIAMTX_CONFIG` (default `/opt/mediamtx/config/mediamtx.yml`).
 2. Points `BACKUP_DIR` at `$BACKUP_DIR` (default `/opt/mediamtx/backups`).
-3. Changes `app.run` from port `5000` to `0.0.0.0:$PORT` (default `5100`).
+3. Changes `app.run` from port `5000` to `127.0.0.1:$PORT` (default `5100`). Loopback only, because the editor trusts `X-Authentik-*` headers.
 4. Changes the MediaMTX API from `localhost:9997` to `127.0.0.1:9898`.
 5. Changes HLS from port `8888` to `127.0.0.1:8980`, the coexistence HLS port.
 6. Points `MEDIAMTX_BINARY` at `/usr/local/bin/mediamtx-docker-wrapper`, so the editor's MediaMTX commands run inside the container (`docker exec mediamtx /mediamtx ...`).
-7. Runs the CloudTAK patch-snapshot script (see below).
+7. Runs the patch-snapshot script (see below).
 8. Re-adds `from mediamtx_ldap_overlay import apply_ldap_overlay` and `apply_ldap_overlay(app)` before `if __name__ == '__main__':` if they're missing.
 
 Then it `exec`s `python3` on the editor.
 
 The script uses `set -e`. If any step fails, startup stops, so the editor never runs unpatched. systemd retries every 5 seconds, and the error is in the journal.
 
-#### CloudTAK patch-snapshot dependency (step 7)
+#### Patch snapshots (step 7)
 
-Step 7 runs `/home/takadmin/CloudTAK/mediamtx-webeditor-patches/apply-patches.sh`. That directory holds two snapshots each of `mediamtx_config_editor.py` and `mediamtx_ldap_overlay.py`:
+Step 7 runs `/opt/mediamtx-webeditor/patches/apply-patches.sh`. That directory holds two snapshots each of `mediamtx_config_editor.py` and `mediamtx_ldap_overlay.py`:
 - `.orig`: the file as it was after the wrapper's sed steps, before the fixes
 - `.patched`: the same file with the fixes applied
 
@@ -474,7 +538,7 @@ On every start the script compares each live file with its snapshots, byte for b
 What this means in practice:
 - **Any change to either file must also go into the snapshots.** That includes an editor self-update, a `git pull` of this repo, a hand edit, or even a comment change. Make the same edit in `.orig` and `.patched`, or, once you've reviewed the change, copy the live file over `.patched`. Otherwise the next restart stops at step 7.
 - Step 7 has to stay after the sed steps (1–6), because the `.orig` snapshots were taken after them.
-- **The path is hardcoded and specific to this deployment.** Other installs need to change it, or remove step 7 if they don't use these patches.
+- **`patches/` is deployment-specific and not part of this repository** (excluded locally via `.git/info/exclude`), because the snapshots can carry local-only changes. Other installs create their own, or remove step 7 if they don't use these patches.
 
 ---
 
@@ -500,7 +564,7 @@ What this means in practice:
 - ✅ Firewall configuration (UFW)
 - ✅ systemd service with auto-start
 
-### 🎨 Web Configuration Editor (v2.1.4)
+### 🎨 Web Configuration Editor (v2.1.12)
 - ✅ **HLS Tuning page** — Segment count, duration, variant, always remux, write queue
 - ✅ **HLS presets** — One-click LAN, Internet, and Satellite (KU/KA) profiles
 - ✅ **MPEG-TS demux toggle** — Enable/disable from the UI
@@ -510,7 +574,7 @@ What this means in practice:
 - ✅ Advanced YAML editor
 - ✅ Service control (start/stop/restart)
 - ✅ Automatic backups before changes
-- ✅ Auto-update from GitHub releases
+- ✅ Auto-update from GitHub releases (off when the editor is write-protected; see [Write-protecting the editor](#write-protecting-the-editor))
 - ✅ **Ku-band link simulator** — Impair incoming traffic for HLS testing
 - ✅ **Share links** — Token-based share links
 
@@ -589,14 +653,15 @@ The MediaMTX control API is mapped to `127.0.0.1:9898` on the host in all Docker
 | Port | Protocol | Purpose |
 |------|---------|---------|
 | 8554 | tcp | RTSP |
-| 8888 | tcp | HLS (8980 in coexistence mode) |
+| 1935 | tcp | RTMP |
 | 8890 | udp | SRT (8981 in coexistence mode) |
-| 8000 | udp | RTP |
-| 8001 | udp | RTCP |
+| 8189 | tcp/udp | WebRTC media (ICE) |
 | 80 | tcp | HTTP (Caddy/ACME only) |
 | 443 | tcp | HTTPS (Caddy only) |
 
-The API port (`9898`) is loopback-only — **no firewall rule needed or added.**
+Keep these off the internet: the API (`127.0.0.1:9898`), HLS (`127.0.0.1:8980`, served through the web editor instead) and WHEP signalling (`127.0.0.1:8887`). RTP/RTCP (`8000`/`8001` udp) only need publishing if `rtspTransports` includes `udp`.
+
+**ufw doesn't protect Docker-published ports.** Docker's NAT rules run before ufw, so publish internal-only ports on `127.0.0.1`, and put any filtering for public container ports in the `DOCKER-USER` chain (for ufw users, a single `*filter` block for `DOCKER-USER` in `/etc/ufw/after.rules`; each `:DOCKER-USER` declaration empties the chain, so don't split it across several blocks).
 
 ---
 
@@ -632,6 +697,6 @@ MIT License - See [LICENSE](LICENSE) file for details.
 
 **Fork maintained by:** dfndr13
 **Upstream:** takwerx/mediamtx-installer
-**Web Editor:** v2.1.4
-**Compatible with:** MediaMTX v1.18.1+ (needs `hlsCDNSecret`; this deployment runs v1.20.0)
+**Web Editor:** overlay tested with v2.1.12 (the copy in `config-editor/` is still v2.1.4)
+**Compatible with:** MediaMTX v1.18.1+ (needs `hlsCDNSecret`; tested with v1.21.2)
 **Tested on:** Ubuntu 22.04 LTS
