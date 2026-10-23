@@ -15,7 +15,7 @@ sed -i "s|CONFIG_FILE = ['\"].*mediamtx\.yml['\"]|CONFIG_FILE = os.environ.get('
 sed -i "s|BACKUP_DIR = ['\"].*['\"]|BACKUP_DIR = os.environ.get('BACKUP_DIR', '/opt/mediamtx/backups')|g" "$APP"
 
 # 3. Port from env var (hardcoded 5000 → env PORT)
-sed -i "s|app\.run(.*port=5000|app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5100))|g" "$APP"
+sed -i "s|app\.run(.*port=5000|app.run(host='127.0.0.1', port=int(os.environ.get('PORT', 5100))|g" "$APP"
 
 # 4. localhost:9997 → 127.0.0.1:9898
 sed -i "s|localhost:9997|127.0.0.1:9898|g" "$APP"

@@ -14,8 +14,11 @@ Patches the vanilla MediaMTX config editor Flask app to:
 
 import os
 import json
+import secrets
+import time
 import urllib.request
 import urllib.error
+from html import escape as html_escape
 from flask import session, request, redirect, jsonify, Response
 
 AK_URL = os.environ.get('AUTHENTIK_API_URL', 'http://127.0.0.1:9090')
@@ -25,6 +28,12 @@ VID_GROUPS = ('vid_private', 'vid_public')
 ADMIN_GROUPS = frozenset({'authentik Admins', 'vid_admin'})
 # AGENCY_ADMIN_SUFFIX removed — using vid_agency_admin group instead
 VIEWER_GROUPS = frozenset({'vid_private', 'vid_public'})
+# Any one of these grants access to the video site; everyone else gets NO_ACCESS_HTML
+VIDEO_GROUPS = ADMIN_GROUPS | VIEWER_GROUPS | {'vid_agency_admin'}
+SHARE_LINKS_FILE = '/opt/mediamtx-webeditor/share_links.json'
+# Longest share link a viewer or agency admin can create (core default 0 = never expires)
+SHARE_MAX_TTL = 86400
+SHARE_DEFAULT_TTL = 14400
 # MediaMTX path source type -> /v3/<endpoint>/kick/{id} (publisher connections only)
 KICK_ENDPOINTS = {
     'rtspSession': 'rtspsessions',
@@ -91,7 +100,9 @@ def _ak_delete(path):
 def apply_ldap_overlay(app):
     """Patch the Flask app for Authentik/LDAP mode."""
 
-    VIEWER_ALLOWED = ('/viewer', '/agency-admin', '/api/viewer/streams', '/api/agency-admin/streams', '/api/agency-admin/visibility', '/api/agency-admin/kill', '/api/viewer/hlscred', '/api/share-links', '/api/share-links/generate', '/api/theme/logo')
+    # No /api/viewer/hlscred (hands out the hlsviewer password) and no /api/share-links
+    # (lists every agency's link tokens); agency admins use /api/agency-admin/share-links
+    VIEWER_ALLOWED = ('/viewer', '/agency-admin', '/api/viewer/streams', '/api/agency-admin/streams', '/api/agency-admin/visibility', '/api/agency-admin/kill', '/api/agency-admin/share-links', '/api/agency-admin/share-links/revoke', '/api/share-links/generate', '/api/theme/logo')
     VIEWER_PREFIXES = ('/watch/', '/hls-proxy/', '/shared/', '/shared-hls/')
 
     def _get_agency_attributes(username):
@@ -133,6 +144,12 @@ def apply_ldap_overlay(app):
             session['agency_name'] = agency_attrs['agency_name']
             session['agency_abbreviation'] = agency_attrs['agency_abbreviation']
             session['_ak_user'] = ak_user
+        # No video group, or a non-admin with no agency (the agency filters would have
+        # nothing to match against): no access at all
+        if not (set(groups) & VIDEO_GROUPS) or (role != 'admin' and not session.get('agency_abbreviation')):
+            session['role'] = 'none'
+            return Response(NO_ACCESS_HTML.replace('{{USERNAME}}', html_escape(ak_user)),
+                            content_type='text/html', status=403)
         # Redirect away from standalone auth pages
         if request.path in ('/login', '/register', '/forgot-password', '/reset-password'):
             return redirect('/')
@@ -199,7 +216,7 @@ def apply_ldap_overlay(app):
         parts = subpath.split("/"); stream_name = "/".join(parts[:2]) if len(parts) >= 2 else parts[0]
         agency_abbr = session.get("agency_abbreviation", "")
         is_global_admin = session.get("role") == "admin"
-        if not is_global_admin and agency_abbr:
+        if not is_global_admin:
             if not _in_agency(subpath, agency_abbr):
                 return "Unauthorized", 403
         vis = _load_visibility()
@@ -249,7 +266,7 @@ def apply_ldap_overlay(app):
         """Public streams: serve HLS player. Private streams: reject unless logged in with vid_private."""
         agency_abbr = session.get("agency_abbreviation", "")
         is_global_admin = session.get("role") == "admin"
-        if not is_global_admin and agency_abbr:
+        if not is_global_admin:
             if not _in_agency(stream_name, agency_abbr):
                 return Response(WATCH_PRIVATE_HTML, content_type="text/html", status=403)
         vis = _load_visibility()
@@ -294,26 +311,90 @@ start();
 
     # Share links (/shared/<token>, /shared-hls/, /api/share-links*) are provided by core; overlay only allows paths for viewers.
 
+    # Same file and record format as core's load_share_links()/save_share_links()
+    def _load_share_links():
+        try:
+            with open(SHARE_LINKS_FILE, 'r') as f:
+                links = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+        now = time.time()
+        return {t: i for t, i in links.items() if not (i.get('expires') and i['expires'] < now)}
+
+    def _save_share_links(links):
+        with open(SHARE_LINKS_FILE, 'w') as f:
+            json.dump(links, f, indent=2)
+
     @app.before_request
     def _agency_share_generate():
-        """Core's /api/share-links/generate has no agency check and only allows admin and viewer.
-        Limit viewers and agency admins to their own agency's streams, and let agency admins
-        generate links too."""
+        """Core's /api/share-links/generate has no agency or private check, allows links that
+        never expire, and only allows admin and viewer. For viewers and agency admins, create
+        the link here instead: own agency only, private streams only with vid_private (agency
+        admins always), and at most SHARE_MAX_TTL. Admins still go through core."""
         role = session.get('role')
         if request.endpoint != 'api_share_links_generate' or role not in ('viewer', 'agency_admin'):
             return None
         agency_abbr = session.get('agency_abbreviation', '')
-        stream = ((request.get_json(silent=True) or {}).get('stream') or '').strip()
+        data = request.get_json(silent=True) or {}
+        stream = (data.get('stream') or '').strip()
         if not _in_agency(stream, agency_abbr):
             return jsonify({'error': 'Unauthorized — not your agency stream'}), 403
-        if role == 'viewer':
-            return None  # agency check passed; core handles viewers
-        # Core checks role in ('admin', 'viewer'); present as viewer for this one call
-        session['role'] = 'viewer'
+        if (role == 'viewer' and _load_visibility().get(stream, 'public') == 'private'
+                and 'vid_private' not in set(session.get('ldap_groups') or [])):
+            return jsonify({'error': 'Unauthorized — private stream'}), 403
         try:
-            return app.view_functions['api_share_links_generate']()
-        finally:
-            session['role'] = 'agency_admin'
+            ttl = int(data.get('ttl') or 0)
+        except (TypeError, ValueError):
+            ttl = 0
+        if ttl <= 0 or ttl > SHARE_MAX_TTL:
+            ttl = SHARE_DEFAULT_TTL
+        now = time.time()
+        token = secrets.token_urlsafe(24)
+        ttl_label = {3600: '1 hour', 14400: '4 hours', 86400: '24 hours'}.get(ttl, f'{ttl // 3600}h')
+        links = _load_share_links()
+        links[token] = {
+            'stream': stream,
+            'created': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now)),
+            'created_by': session.get('username', ''),
+            'expires': now + ttl,
+            'ttl_label': ttl_label,
+        }
+        _save_share_links(links)
+        # Caddy talks to us over plain HTTP; use the scheme the browser used (see core)
+        scheme = request.headers.get('X-Forwarded-Proto', request.scheme).split(',')[0].strip()
+        return jsonify({'ok': True, 'token': token, 'url': f'{scheme}://{request.host}/shared/{token}',
+                        'stream': stream, 'ttl_label': ttl_label})
+
+    @app.route('/api/agency-admin/share-links')
+    def api_agency_admin_share_links():
+        """Active share links for the agency admin's own agency's streams."""
+        if session.get('role') != 'agency_admin':
+            return jsonify({'error': 'Unauthorized'}), 403
+        agency_abbr = session.get('agency_abbreviation', '')
+        links = _load_share_links()
+        result = [{'token': t, 'stream': i.get('stream', ''), 'created': i.get('created', ''),
+                   'created_by': i.get('created_by', ''), 'expires': i.get('expires'),
+                   'ttl_label': i.get('ttl_label', '')}
+                  for t, i in links.items() if _in_agency(i.get('stream', ''), agency_abbr)]
+        result.sort(key=lambda x: x['created'], reverse=True)
+        return jsonify({'links': result})
+
+    @app.route('/api/agency-admin/share-links/revoke', methods=['POST'])
+    def api_agency_admin_share_links_revoke():
+        """Revoke a share link, only if it is for one of the agency admin's own streams."""
+        if session.get('role') != 'agency_admin':
+            return jsonify({'error': 'Unauthorized'}), 403
+        agency_abbr = session.get('agency_abbreviation', '')
+        token = ((request.get_json(silent=True) or {}).get('token') or '').strip()
+        links = _load_share_links()
+        info = links.get(token)
+        if not info:
+            return jsonify({'error': 'Link not found or already expired'}), 404
+        if not _in_agency(info.get('stream', ''), agency_abbr):
+            return jsonify({'error': 'Unauthorized — not your agency stream'}), 403
+        del links[token]
+        _save_share_links(links)
+        return jsonify({'ok': True})
 
     # ── Active Streams viewer page (vid_public / vid_private) ────────────
 
@@ -395,7 +476,7 @@ start();
                 name = p.get('name') or p.get('confName') or ''
                 agency_abbr = session.get('agency_abbreviation', '')
                 is_global_admin = session.get('role') == 'admin'
-                if not is_global_admin and agency_abbr and not name.upper().startswith(agency_abbr.upper() + '/'):
+                if not is_global_admin and not _in_agency(name, agency_abbr):
                     continue
                 if not name:
                     continue
@@ -796,6 +877,17 @@ WATCH_PRIVATE_HTML = '''<!DOCTYPE html>
 .box{max-width:400px;padding:40px}.icon{font-size:48px;margin-bottom:16px}h1{font-size:22px;margin-bottom:8px}p{color:#888;font-size:14px;line-height:1.6}</style></head>
 <body><div class="box"><div class="icon">&#x1F6E1;</div><h1>Private Stream</h1><p>This stream is restricted. You need a share link from an authorized user, or log in with the appropriate access level.</p></div></body></html>'''
 
+# Logged in to Authentik, but no vid_* group (or no agency): see _authentik_auto_auth
+NO_ACCESS_HTML = '''<!DOCTYPE html>
+<html><head><title>No Video Access</title>
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#121212;color:#e0e0e0;font-family:'Segoe UI',system-ui,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;text-align:center;padding:16px}
+.box{max-width:440px;padding:40px}.icon{font-size:48px;margin-bottom:16px}h1{font-size:22px;margin-bottom:8px}p{color:#aaa;font-size:15px;line-height:1.6}
+.user{color:#777;font-size:13px;margin-top:20px}a{display:inline-block;margin-top:16px;color:#fff;background:#333;border:1px solid #555;border-radius:4px;padding:8px 18px;font-size:13px;text-decoration:none}a:hover{background:#444}</style></head>
+<body><div class="box"><div class="icon">&#x1F512;</div><h1>No Video Access</h1>
+<p>You do not have access to the video page. Contact your agency administrator for access.</p>
+<p class="user">Signed in as {{USERNAME}}</p><a href="/logout">Sign out</a></div></body></html>'''
+
 # ════════════════════════════════════════════════════════════════════════
 # Active Streams viewer page (vid_public / vid_private — regular users)
 # ════════════════════════════════════════════════════════════════════════
@@ -870,17 +962,9 @@ function watchStream(name){
   window.open('/watch/'+name,'_blank');
 }
 
+// Always a 4-hour token link, public or private, so it opens without a login
 function shareStream(name,vis,btn){
   btn.disabled=true;btn.style.opacity='0.6';
-  if(vis==='public'){
-    var url=window.location.origin+'/watch/'+encodeURIComponent(name);
-    navigator.clipboard.writeText(url).then(function(){}).catch(function(){
-      var inp=document.createElement('input');inp.value=url;document.body.appendChild(inp);inp.select();document.execCommand('copy');document.body.removeChild(inp);
-    });
-    btn.textContent='\u2705 Link Copied!';btn.style.background='#16a34a';
-    setTimeout(function(){btn.innerHTML='&#x1F517; Share';btn.style.background='#2563eb';btn.disabled=false;btn.style.opacity='1'},3000);
-    return;
-  }
   btn.textContent='Generating...';
   fetch('/api/share-links/generate',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({stream:name,ttl:14400})})
@@ -1006,6 +1090,9 @@ td{padding:12px;border-top:1px solid #333;vertical-align:middle}
   <div class="page-title">{{AGENCY_NAME}} — Stream Management</div>
   <div class="page-sub">Manage your agency's streams. Changes apply immediately.</div>
   <div id="content"><div class="loading"><div class="spinner"></div><div>Loading streams...</div></div></div>
+  <div class="page-title" style="margin-top:32px">Active share links</div>
+  <div class="page-sub">Anyone with one of these links can watch without logging in until it expires. Revoke a link to stop it immediately.</div>
+  <div id="links"><div class="empty">Loading...</div></div>
 </div>
 <div class="toast" id="toast"></div>
 <script>
@@ -1013,21 +1100,15 @@ function escapeHtml(s){var d=document.createElement('div');d.textContent=s;retur
 
 function watchStream(name){window.open('/watch/'+name,'_blank');}
 
+// Always a 4-hour token link, public or private, so it opens without a login
 function shareStream(name,vis,btn){
   btn.disabled=true;
-  if(vis==='public'){
-    var url=window.location.origin+'/watch/'+encodeURIComponent(name);
-    navigator.clipboard.writeText(url).catch(function(){var i=document.createElement('input');i.value=url;document.body.appendChild(i);i.select();document.execCommand('copy');document.body.removeChild(i);});
-    btn.textContent='✅ Copied!';btn.style.background='#16a34a';
-    setTimeout(function(){btn.textContent='🔗 Share';btn.style.background='#2563eb';btn.disabled=false;},3000);
-    return;
-  }
   btn.textContent='Generating...';
   fetch('/api/share-links/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({stream:name,ttl:14400})})
   .then(function(r){return r.json();}).then(function(d){
     if(d.ok&&d.url){
       navigator.clipboard.writeText(d.url).catch(function(){var i=document.createElement('input');i.value=d.url;document.body.appendChild(i);i.select();document.execCommand('copy');document.body.removeChild(i);});
-      btn.textContent='✅ Copied! (4h)';btn.style.background='#16a34a';
+      btn.textContent='✅ Copied! (4h)';btn.style.background='#16a34a';loadLinks();
       setTimeout(function(){btn.textContent='🔗 Share';btn.style.background='#2563eb';btn.disabled=false;},3000);
     }else{btn.textContent='Error';btn.style.background='#dc2626';setTimeout(function(){btn.textContent='🔗 Share';btn.style.background='#2563eb';btn.disabled=false;},2000);}
   }).catch(function(){btn.textContent='Error';btn.style.background='#dc2626';setTimeout(function(){btn.textContent='🔗 Share';btn.style.background='#2563eb';btn.disabled=false;},2000);});
@@ -1096,8 +1177,42 @@ async function loadStreams(){
   }
 }
 
+function revokeLink(token,btn){
+  if(!confirm('Revoke this share link? Anyone using it will lose the stream.'))return;
+  btn.disabled=true;
+  fetch('/api/agency-admin/share-links/revoke',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:token})})
+  .then(function(r){return r.json();}).then(function(d){
+    if(d.ok){toast('Link revoked','success');loadLinks();}
+    else{toast('Error: '+(d.error||'unknown'),'error');btn.disabled=false;}
+  }).catch(function(){toast('Request failed','error');btn.disabled=false;});
+}
+
+async function loadLinks(){
+  var el=document.getElementById('links');
+  try{
+    var r=await fetch('/api/agency-admin/share-links');
+    var data=await r.json();
+    if(!r.ok)throw new Error(data.error||'Failed');
+    var links=data.links||[];
+    if(links.length===0){el.innerHTML='<div class="empty">No active share links.</div>';return;}
+    var html='<table><thead><tr><th>Stream</th><th>Created by</th><th>Expires</th><th></th></tr></thead><tbody>';
+    for(var i=0;i<links.length;i++){
+      var l=links[i];
+      var exp=l.expires?new Date(l.expires*1000).toLocaleString():'Never';
+      html+='<tr><td><span class="stream-name">'+escapeHtml(l.stream)+'</span></td>';
+      html+='<td>'+escapeHtml(l.created_by||'')+'</td><td>'+escapeHtml(exp)+'</td>';
+      html+='<td><button class="btn btn-kill" onclick="revokeLink(\''+escapeHtml(l.token).replace(/\'/g,"\\\'")+'\',this)">Revoke</button></td></tr>';
+    }
+    el.innerHTML=html+'</tbody></table>';
+  }catch(err){
+    el.innerHTML='<div class="empty"><p>'+escapeHtml(err.message)+'</p></div>';
+  }
+}
+
 loadStreams();
+loadLinks();
 setInterval(loadStreams,15000);
+setInterval(loadLinks,15000);
 </script>
 </body>
 </html>
