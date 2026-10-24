@@ -670,6 +670,31 @@ authInternalUsers:
 
 Requests from the host to a published port reach the container from the Docker bridge gateway, not from `127.0.0.1`, so add that gateway address (`docker network inspect <network> --format '{{(index .IPAM.Config 0).Gateway}}'`). With `ips: []`, any container that can reach the API gets full control. Afterwards, check that a call from another container gets `401`. Remove any API user you don't use, especially password users with an empty `ips` list: they work from anywhere the port is reachable.
 
+### Restricting who can publish (optional)
+
+By default anyone who can reach the RTSP/RTMP/SRT ports can publish to any path, and `overridePublisher: yes` lets a newcomer take over a path that's already live. Two changes help without putting passwords in `mediamtx.yml` or changing pilots' URLs:
+
+- **Block takeovers:** `pathDefaults: overridePublisher: no`. A second publisher to a live path is refused. After a network drop, a device may have to wait until its old session times out.
+- **Check publishes with your own endpoint:** set `authMethod: http` and point `authHTTPAddress` at a small local service that answers 2xx to allow and anything else to refuse. For example, it allows `publish` only when the first path segment is a known agency (`MPD/drone1`), and allows `api`/`metrics`/`pprof` only from the addresses you'd have listed in `ips`.
+
+```yaml
+authMethod: http
+authHTTPAddress: http://<docker-bridge-gateway>:<port>/auth
+authHTTPExclude:      # skipped by the endpoint and allowed for everyone
+- action: read
+- action: playback
+pathDefaults:
+  overridePublisher: no
+```
+
+Watch out:
+
+- **With `authMethod: http`, `authInternalUsers` is ignored**, including the API `ips` restriction above, so the endpoint must enforce it.
+- **Never leave `api`, `metrics` or `pprof` in `authHTTPExclude`** (the stock config has them there). Excluded actions are allowed for everyone who can reach the port, including other containers.
+- **Exclude `read` and `playback`** so viewing keeps working even if the endpoint is down.
+- **ufw blocks containers from reaching host services by default**, so allow the MediaMTX Docker network to reach the endpoint's port.
+- **Restart MediaMTX after editing.** Test that a publish to an unknown path is refused and that an API call from another container gets `401`.
+
 ### WebRTC: advertise only public addresses
 
 By default (`webrtcIPsFromInterfaces: yes`), MediaMTX lists every interface address in its WebRTC answers. Inside Docker that means container and bridge addresses, which remote viewers can't use and which reveal your internal network layout. List only the addresses viewers should use instead:
